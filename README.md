@@ -4,13 +4,14 @@ Local-first WeChat group archive and agent assistant.
 
 [简体中文](README.zh-CN.md)
 
-WeChat Oracle records WeChat group messages through [WeFlow](https://github.com/hicccc77/WeFlow), stores them in SQLite, optionally OCRs images and transcribes voice messages locally, and lets an LLM-backed bot answer questions inside the group. The bot can also maintain long-term per-group memory in the background.
+WeChat Oracle records selected WeChat group messages through an explicitly authorized local reader, [WeFlow](https://github.com/hicccc77/WeFlow), or visible UI fallback; stores them in SQLite; and uses an OpenAI-compatible model for replies and scheduled summaries. It can also OCR images, transcribe voice locally, and maintain long-term per-group memory.
 
 The project is designed for a personal Windows machine running WeChat PC. Message data, media, memory, and debug logs stay under `data/` unless you explicitly send content to an LLM or vision provider.
 
 ## What It Does
 
 - Ingests live WeChat messages from WeFlow SSE into SQLite.
+- With explicit consent, discovers local WeChat groups and incrementally imports only the selected canonical groups into SQLite.
 - Imports historical WeFlow JSON exports.
 - Stores normalized messages, forwarded-message children, media paths, OCR/ASR transcripts, command runs, agent memory, and audit traces.
 - Answers in group chat through wx4py UI automation.
@@ -18,6 +19,7 @@ The project is designed for a personal Windows machine running WeChat PC. Messag
 - Supports free-form agent chat when directly mentioned, replied to, or probability-triggered.
 - Supports Local Ask from the terminal UI or CLI: ask the bot about one selected group without sending anything to WeChat.
 - Runs a silent `lurk` learning path that updates `group_memory` / `persona_drift` without sending group messages.
+- Can send detailed summaries for the previous completed hour and previous natural day on an idempotent schedule.
 - Can use either the native in-process tool loop or an OpenClaw-backed runtime for agent turns.
 
 ## Architecture
@@ -48,15 +50,15 @@ Production can be started with one supervisor command:
 uv run wechat-oracle run
 ```
 
-`run` starts `ingest live` and `dispatcher` together. `ingest live` starts the SSE subscriber and an embedded mm worker thread. `dispatcher` polls SQLite, processes explicit commands and agent triggers with per-group ordering and cross-group parallelism, and serializes all wx4py sends through one sender thread so only one GUI operation touches WeChat at a time.
+`run` starts the selected ingest backend and `dispatcher` together. `WO_INGEST_BACKEND=weflow` uses the HTTP/SSE subscriber; `wx4py` reads text/link events exposed by the visible WeChat UI. `dispatcher` polls SQLite, processes explicit commands and agent triggers, and serializes all sends.
 
-By default `run` opens a Textual terminal UI: the top area stays fixed with bot configuration, selected Local Ask group, and process status, while the rest of the screen scrolls live logs from both child processes. Press `a` to open a one-shot Local Ask dialog, or `c` to edit the agent backend/model, probability wakeup, and reply mention policy. Saving the config writes `.env` and restarts the dispatcher so group replies use the new settings. Use `uv run wechat-oracle run --plain` to disable the TUI and let child processes write directly to the terminal.
+By default `run` opens a Textual terminal UI: the top area stays fixed with configuration, selected Local Ask group, and process status, while the rest of the screen scrolls child-process logs. Press `a` for a one-shot Local Ask, or `c` to configure the OpenAI-compatible endpoint/key/model, authorized local account/groups, hourly/daily schedules, and reply policy. The API key can be replaced but is never loaded back into the UI. Saving atomically updates `.env` and restarts affected processes. The initial UI uses the native SQLite/API path and does not require Pi Agent. Use `uv run wechat-oracle run --plain` to disable the TUI.
 
 ## Requirements
 
 - Windows 10/11.
-- WeChat PC 4.1.8.107, Qt version, is the recommended runtime for wx4py replies. Newer 4.1.10.x clients may break UI control.
-- [WeFlow desktop](https://github.com/hicccc77/WeFlow) with HTTP API enabled. This project does not install WeFlow for you; install and start it first, then copy the HTTP API access token into `WO_WEFLOW_TOKEN`.
+- WeChat PC 4.x, Qt version. UI Automation compatibility changes between releases and must be checked with `doctor` before enabling replies.
+- A message source: the reviewed Weixin `4.1.11.55` local reader after explicit consent, WeFlow HTTP/SSE when an official functional build is available, or the `wx4py` visible-UI fallback. The local reader refuses an unreviewed Weixin build.
 - Python 3.12+.
 - [uv](https://docs.astral.sh/uv/).
 - An OpenAI-compatible LLM endpoint, or OpenClaw local gateway for `WO_AGENT_BACKEND=openclaw`.
@@ -74,16 +76,63 @@ uv run wechat-oracle doctor
 uv run wechat-oracle run
 ```
 
-`setup` writes a minimal `.env`, `doctor` checks the database, WeFlow, the selected agent backend, and the reply path, and `run` starts live ingest plus dispatcher with a small terminal UI. On Windows you can also double-click `scripts\run.bat` after setup.
+`setup` writes a minimal `.env`, `doctor` checks the database, selected ingest/agent backend, and reply path, and `run` starts ingest plus dispatcher with a small terminal UI. On Windows you can also double-click `scripts\run.bat` after setup.
 
-Before running `setup`, install and start WeFlow, open its settings, enable the HTTP API service, and copy the access token when prompted.
+### Desktop GUI (PySide6)
+
+Install the optional GUI dependency and launch the desktop window:
+
+```powershell
+uv sync --extra gui
+uv run wechat-oracle gui
+```
+
+The GUI organizes daily operations around six pages: 首页 dashboard, 采集与群管理, 自动回复管理, 模型管理, 知识库管理, and 设置. It reads the same SQLite database and `.env` as the CLI; saved values are written atomically to `.env`. It is a control/display layer only and does not start or stop the `ingest` / `dispatcher` processes.
+
+## Windows Portable EXE
+
+Build the console-mode, Windows x64 `onedir` package on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+```
+
+For an in-place rebuild of this machine's existing portable installation, add
+`-PreserveLocalConfig`. It temporarily safeguards and restores the existing
+`dist\WeChatOracle\.env`; ordinary release builds still reject runtime
+configuration and secrets from the output.
+
+The result is `dist\WeChatOracle\WeChatOracle.exe`. Keep and distribute the entire `dist\WeChatOracle` directory because the executable depends on its `_internal` directory. The first no-argument launch opens `setup` when `.env` is absent; later no-argument launches run the assistant. Explicit commands remain available:
+
+```powershell
+.\WeChatOracle.exe doctor
+.\WeChatOracle.exe init-db
+.\WeChatOracle.exe run
+.\WeChatOracle.exe openclaw mcp-serve
+```
+
+The build includes the reviewed local-read implementation, but deliberately excludes `.env`, `data/`, personas, logs, raw/decrypted WeChat databases, database keys, and everything under `experimental/`. Keep the portable directory in a user-writable location rather than `Program Files`; runtime configuration and data live beside the executable. The speech model is downloaded to the user's cache on first ASR use.
+
+`wx4py` is licensed under AGPL-3.0-or-later. The build copies its license and `THIRD_PARTY_NOTICES.md` into the output. A local personal build can be tested here, but do not redistribute it until the applicable source-distribution and other license obligations have been reviewed.
+
+When using `WO_INGEST_BACKEND=weflow`, start an official functional WeFlow build and enable its HTTP API first. With `wx4py`, keep WeChat unlocked and visible; only UI-exposed text/link rows are archived, sender identity is unavailable, and downtime cannot be reconstructed completely.
+
+Before enabling sends, test one exact group without sending anything:
+
+```powershell
+uv run wechat-oracle ingest ui-probe "人心黄黄"
+```
 
 For manual setup, create `.env` in the repository root. Start with the common settings:
 
 ```env
-# WeFlow
-WO_WEFLOW_TOKEN=<weflow-token>
-WO_GROUPS=
+# Local archive. Keep disabled until the in-app setup has shown the account and groups.
+WO_RAW_WECHAT_ENABLED=False
+WO_RAW_WECHAT_ACCOUNT=
+WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=30
+WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED=True
+WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS=300
+WO_GROUPS=[]
 
 # Bot identity in the target group
 WO_BOT_NAME=<bot-group-nickname>
@@ -92,8 +141,24 @@ WO_BOT_NAME=<bot-group-nickname>
 
 # Reply path
 WO_REPLY=True
-WO_REPLY_BACKEND=wx4py
+WO_REPLY_BACKEND=uia-direct
 WO_REPLY_MENTION_POLICY=explicit
+WO_REPLY_ALLOWED_GROUPS=人心黄黄
+WO_REPLY_FAIL_CLOSED=True
+
+# Previous completed hour and previous natural day. Both are opt-in.
+WO_HOURLY_SUMMARY_ENABLED=False
+WO_DAILY_SUMMARY_ENABLED=False
+WO_SUMMARY_TIMEZONE=Asia/Hong_Kong
+WO_SUMMARY_SYNC_GRACE_SECONDS=300
+
+# Evidence-linked per-member profiles. Enable from the dashboard only after
+# reviewing the archived-message estimate and privacy warning.
+WO_MEMBER_KB_ENABLED=False
+WO_MEMBER_KB_INTERVAL_SECONDS=3600
+WO_MEMBER_KB_CHUNK_CHARS=24000
+WO_MEMBER_KB_MAX_CONCURRENCY=2
+WO_MEMBER_KB_RETRIES=3
 
 # Optional agent tuning
 WO_AGENT_BASE_PROBABILITY=0.25
@@ -102,7 +167,7 @@ WO_AGENT_CONTINUATION_ENABLED=True
 WO_AGENT_CONTINUATION_MAX_FOLLOWUPS=2
 WO_AGENT_CONTINUATION_DELAY_SECONDS=90
 WO_AGENT_CONTINUATION_TTL_SECONDS=600
-WO_AGENT_RECENT_CONTEXT_CHAT=100
+WO_AGENT_RECENT_CONTEXT_CHAT=40
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
 
@@ -121,9 +186,7 @@ WO_AGENT_LURK_MIN_NEW_MESSAGES=20
 
 `WO_BOT_NAME` and `WO_BOT_WXID` identify different things. `WO_BOT_NAME` is the nickname used to detect real `@<bot>` mentions in the group. `WO_BOT_WXID` is the bot account's own wxid and is only needed for the reply-to-bot trigger. The dispatcher auto-discovers it from stored bot messages when possible; set it manually if quote-replying to the bot does not wake the agent.
 
-Then choose one agent backend.
-
-Option A: use an ordinary OpenAI-compatible API directly:
+The initial portable configuration uses the built-in SQLite memory and native OpenAI-compatible client:
 
 ```env
 WO_AGENT_BACKEND=native
@@ -132,7 +195,7 @@ WO_LLM_ENDPOINT=https://api.deepseek.com
 WO_LLM_MODEL=deepseek-v4-pro
 ```
 
-Option B: use OpenClaw as the agent runtime:
+The source tree retains OpenClaw as an advanced compatibility path, but it is not part of the initial setup flow. If needed, configure it manually:
 
 ```env
 WO_AGENT_BACKEND=openclaw
@@ -141,6 +204,8 @@ WO_OPENCLAW_TOKEN=<gateway-token>
 WO_OPENCLAW_AGENT_ID=<your-agent-id>
 WO_OPENCLAW_TIMEOUT_SECONDS=300
 ```
+
+Pi Agent is not bundled, configured, or required by the initial portable build.
 
 Then either run both processes through the supervisor:
 
@@ -204,6 +269,55 @@ uv run wechat-oracle agent wipe <group_id> --persona-only
 uv run wechat-oracle agent wipe <group_id> --memory-only -y
 ```
 
+Per-group member knowledge:
+
+```powershell
+uv run wechat-oracle member-kb status --group-id <group_id>
+uv run wechat-oracle member-kb bootstrap --group-id <group_id>
+uv run wechat-oracle member-kb run-once --group-id <group_id>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid-or-exact-name>
+uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid> --messages --limit 50
+uv run wechat-oracle member-kb delete --group-id <group_id> --member <wxid> --yes
+uv run wechat-oracle member-kb rebuild --group-id <group_id> --member <wxid> --yes
+WeChatOracle.exe member-kb send-random "Exact Group Name" --yes
+WeChatOracle.exe member-kb send "Exact Group Name" <wxid-or-exact-name> --display-name "Verified Current Group Name" --yes
+WeChatOracle.exe member-kb broadcast-all "Exact Group Name" --skip-member <already-sent-wxid> --yes
+WeChatOracle.exe member-kb broadcast-status
+```
+
+`send-random` selects only a non-UNKNOWN member whose full-history bootstrap is
+complete and whose profile contains a summary or current evidence-linked claim.
+It renders `#成员画像（name）` without copying raw messages, requires exact group
+authorization plus action-time `--yes`, and uses the persistent delivery outbox;
+an uncertain send is never automatically retried. When profile JSON fails schema
+validation, the automatic retry receives bounded validation feedback with no chat
+content. Profile, evidence, and cursor writes remain atomic.
+`send` targets one exact completed member through the same authorization and
+outbox path; its optional title is only for a separately verified current group nickname.
+`broadcast-all` creates a persistent member snapshot. The running product waits
+for automatic member-KB completion and sends each eligible profile exactly once;
+restart recovery uses deterministic outbox markers, UNKNOWN is excluded, and
+profile delivery pauses around the hourly-summary grace window.
+
+One-shot real summary delivery uses the same authorization, idempotent outbox,
+and UIA sender as scheduled summaries. It is independent of `WO_REPLY` and
+requires an explicit action-time `--yes` confirmation:
+
+```powershell
+WeChatOracle.exe summary send-once "Exact Group Name" --period previous-hour --yes
+WeChatOracle.exe summary send-once "Exact Group Name" --period latest-active-hour --yes
+WeChatOracle.exe summary send-once "Exact Group Name" --start 2026-08-12T08:00 --end 2026-08-12T09:00 --yes
+```
+
+Use `--retry-failed` only when retrying a failed/skipped generation that never
+created a delivery record. A sent, unknown, or in-progress delivery is never
+reset or retried automatically. `--start` and `--end` must be supplied together;
+naive values use `WO_SUMMARY_TIMEZONE`, and the end boundary is exclusive.
+
+The raw-message library is the existing `messages` table; it is not duplicated. Profiles and claims are group-scoped, retain evidence message IDs, preserve superseded claims, and never merge the same wxid across groups. Press `k` in the dashboard to browse members, evidence, and original messages or to edit/lock profile sections. After the operator enables and saves the feature, the product automatically replays full history in the background and resumes from per-member cursors after interruption. At each clock hour it waits for the five-minute sync grace, updates only members with new messages, and schedules that work before the matching group summary. `bootstrap` remains a troubleshooting command, not a normal operating step. Enabling this feature sends selected group messages and derived profiles to the configured OpenAI-compatible API. In this installation, sensitive inferences are allowed in profiles and may be used by replies and scheduled summaries.
+
+Summary attribution is a built-in output policy. When the chat source supplies reliable display names, summaries name the relevant speakers instead of reducing them to generic “group member said” phrasing, and use a light, playful tone with restrained emoji. A generic first draft is regenerated once; if the retry still violates attribution, that period fails closed and is not delivered. Missing identities are rendered as unidentified or left unattributed; the model must never guess a name. Authorized local-database ingestion can provide identity data, while visible-UI history alone does not guarantee sender identities.
+
 Health checks:
 
 ```powershell
@@ -261,6 +375,36 @@ If a media file referenced by the export is missing, the message is still import
 
 Backfilled rows use `source='backfill'`. The dispatcher only wakes on new `source='live'` rows, so importing old messages will not make the bot reply to historical mentions. Backfilled messages are still available to `/find`, `/sum`, `/recent`, agent history search, and manual or automatic `lurk` learning.
 
+### Authorized Local WeChat Archive
+
+For the exact signed Windows Weixin `4.1.11.55` build reviewed by this project, the opt-in local reader can discover accounts and groups, copy stable WCDB message/contact snapshots, and incrementally import only canonical groups selected by the user. It is disabled until `WO_RAW_WECHAT_ENABLED=True`; the first-run UI performs the same account/group authorization flow as these CLI commands.
+
+```powershell
+# Sanitized inventory; no opt-in and no key scan.
+uv run wechat-oracle raw scan
+
+# After setting WO_RAW_WECHAT_ENABLED=True, list canonical groups.
+$account = '<anonymous account fingerprint from scan>'
+uv run wechat-oracle raw groups --account $account
+uv run wechat-oracle raw authorize '<...@chatroom>' --account $account
+
+# One incremental cycle, or continuous monitoring.
+uv run wechat-oracle raw sync --account $account
+uv run wechat-oracle raw run --account $account
+
+# Inspect or revoke persisted authorization.
+uv run wechat-oracle raw status
+uv run wechat-oracle raw revoke '<...@chatroom>' --account $account
+```
+
+The reader refuses unrecognized executable/module hashes. It discovers every numeric `message_0.db` ... `message_N.db` shard, opens Weixin processes with read/query permissions only, accepts a candidate key only after checking database-page authentication, keeps the raw key in memory, and emits only anonymous fingerprints and counts. Continuous sync decrypts only changed shards and never advances a cursor before normalized archive writes commit.
+
+Source databases are never modified. A database and its WAL must remain unchanged across a complete copy attempt before the snapshot is accepted; transient SHM state is not copied. WAL header/frame checksums, salts, every database-page HMAC, and the last commit marker are validated before committed frames are applied. Temporary snapshots stay under git-ignored `data/raw_wechat/`; full decrypted copies are removed after selected messages are normalized, and every snapshot must pass SQLite `quick_check` before use.
+
+Authorization persists the exact account fingerprint, canonical `@chatroom` id, display name, and contact-database generation. A contact-generation change pauses that group until it is selected again. Imports include `local_type=1` text rows, pass through the normal deduplicating writer with `source='backfill'`, and the raw module has no reply/send capability. The canonical id also joins raw history with UI live context and prevents duplicate scheduled summaries. The profile is build-specific and must not be reused after a Weixin update until the new binary and database format are separately reviewed.
+
+Scheduled summaries run only for groups that have both a persisted canonical authorization and an exact display-name send allowlist. Hourly output starts with `#过去一小时话题`; daily output starts with `#过去一天话题`. Generation and send claims are crash-safe and idempotent. If the process loses certainty after submitting a UI send, that delivery is marked `unknown` and is never retried automatically, which favors avoiding duplicate group posts.
+
 ## In-Group Commands
 
 The dispatcher accepts explicit slash commands either as `@<bot> /cmd ...` or as a standalone `/cmd ...` group message.
@@ -268,7 +412,7 @@ The dispatcher accepts explicit slash commands either as `@<bot> /cmd ...` or as
 | Command | Purpose |
 |---|---|
 | `/find [from:<person>\|@<person>] [since:YYYY[-MM[-DD]]] <query>` | Semantic search over the current group archive. |
-| `/sum [from:<person>\|@<person>] [since:YYYY[-MM[-DD]]] [limit:N] [topic]` | Summarize current-group messages. |
+| `/sum [from:<person>\|@<person>] [since:date] [until:date] [limit:N] [topic]` | Hierarchically summarize an uncapped current-group period. |
 | `/recent [N]` | Show recent ingested messages without calling an LLM. |
 | `/ask <question>` | Lightweight LLM call with no group-history context. |
 | `/explain [text]` | Explain quoted message or supplied text. |
@@ -280,6 +424,8 @@ Examples:
 ```text
 @Assistant /find from:Alice since:2026-05 about home renovation
 @Assistant /sum limit:100 what did people discuss last night?
+@Assistant 总结一下昨天聊了什么
+@Assistant 总结最近3小时的装修讨论
 @Assistant /recent 20
 @Assistant /ask What is SQLite WAL?
 Reply to an image and send: @Assistant /explain
@@ -328,7 +474,7 @@ Follow-ups use the same per-group dispatcher queue and serialized wx4py sender a
 The native agent has two phases:
 
 - Phase A reads recent context, may call read-only tools, and returns either a chat reply or `stay_silent`.
-- Phase B sees the Phase A trace and may update `group_memory` or `persona_drift`.
+- Phase B sees the Phase A trace and may update `group_memory` or `persona_drift`. It is disabled on interactive chat by default so a generated reply is not held behind memory writes; enable auto-lurk for background group-culture learning.
 
 Phase A initial context includes the latest `WO_AGENT_RECENT_CONTEXT_CHAT` messages from the current group. Tools can search older history, expand quote chains, expand forwarded bundles, read OCR/ASR text, read images through a vision model, read voice transcripts, or read group memory.
 
@@ -360,7 +506,7 @@ Local Ask defaults to read-only: it may read recent context, search history, ins
 - First run reads the latest `WO_AGENT_LURK_RECENT_MSGS` messages.
 - Later runs continue from `agent_lurk_state.last_msg_id`.
 - The lurk agent may call history tools to inspect older messages when the new batch points to prior context.
-- It writes only stable, reusable knowledge to `group_memory` or long-term behavior adjustments to `persona_drift`.
+- It writes only stable group culture, rules, shared topics, and reusable group-level jokes to `group_memory`, or long-term behavior adjustments to `persona_drift`. Per-member facts stay in member-kb.
 - It never calls wx4py and never sends an acknowledgement.
 
 Enable automatic lurk inside dispatcher with:
@@ -389,7 +535,7 @@ WO_AGENT_BACKEND=native
 WO_AGENT_BACKEND=openclaw
 ```
 
-Important distinction: OpenClaw here is an agent runtime backend, not a WeChat reply backend. Group replies still go through wx4py or `stdout`.
+Important distinction: OpenClaw here is an agent runtime backend, not a WeChat reply backend. Group replies still go through `uia-direct`, wx4py, or `stdout`.
 
 OpenClaw-related settings:
 
@@ -403,7 +549,9 @@ WO_OPENCLAW_TIMEOUT_SECONDS=300
 
 ## Real WeChat Mentions
 
-`Wx4pyReplier` attempts to create a real WeChat group mention token by opening the group, typing `@`, selecting the requester from WeChat's candidate popup, then pasting the reply body. If the candidate cannot be detected, it falls back to plain text `@name` and logs a warning.
+`UiaDirectReplier` is the preferred WeChat 4.x sender when mouse simulation is undesirable. It passively attaches to the existing WeChat window (without wx4py's registry repair/restart path), opens one exact session or unique exact search result through UI Automation accessibility actions, verifies that the same session is selected, focuses the chat edit, writes through ValuePattern (clipboard plus focused keyboard input only as a fallback), and submits with Enter. It never calls `Click`, `DoubleClick`, or wx4py's public `send_to()` path. Windows must still be unlocked and WeChat's main window must exist.
+
+Both `UiaDirectReplier` and `Wx4pyReplier` create a real WeChat group mention token by opening the group, typing `@`, selecting the requester from WeChat's candidate popup, then placing the reply body. If the candidate cannot be detected and verified, the send is refused; neither backend silently falls back to literal `@name` text.
 
 This path is used only when `WO_REPLY_MENTION_POLICY` says the current reply should mention someone.
 
@@ -433,11 +581,15 @@ Key tables:
 | Table | Purpose |
 |---|---|
 | `messages` | Normalized WeChat messages. |
+| `group_aliases` | Maps display-name UI ids onto verified canonical `@chatroom` ids. |
 | `forwarded_records` | Children inside merged-forward messages. |
 | `command_runs` | Dispatcher idempotency and command status. |
 | `group_state` | Live/backfill per-group cursors. |
 | `persona_drift` | Per-group evolvable behavior supplement. |
 | `group_memory` | Per-group freeform long-term memory document. |
+| `member_profiles` / `member_alias_history` | Group-scoped structured member profiles, manual locks, and nickname history. |
+| `member_claims` / `member_claim_evidence` | Permanent profile claims with basis, confidence, sensitivity, status, and source message IDs. |
+| `member_update_state` / `member_update_runs` | Resumable per-member cursors and profile-update audit runs. |
 | `agent_run_log` | Agent audit traces for chat, lurk, and Local Ask turns. |
 | `agent_lurk_state` | Lurk cursor, separate from audit logs. |
 | `agent_proactive_outbox` | Delayed proactive continuation jobs. Stores intent, not pre-generated reply text. |
@@ -456,10 +608,18 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_DB_PATH` | `data/wechat-oracle.db` | SQLite database path. |
 | `WO_MEDIA_DIR` | `data/media` | Media directory. |
 | `WO_GROUPS` | `[]` | Empty means all WeFlow group sessions; comma string or JSON list is accepted. |
+| `WO_RAW_WECHAT_ENABLED` | `False` | Enables the reviewed local WeChat reader after explicit consent. |
+| `WO_RAW_WECHAT_ACCOUNT` | empty | Exact anonymous account fingerprint selected by the user. |
+| `WO_RAW_WECHAT_WORKSPACE` | `data/raw_wechat` | Git-ignored staging/state directory for stable snapshots. |
+| `WO_RAW_WECHAT_INSTALL_ROOT` | `D:\0softwear\Weixin` | Supported Weixin install root; running-process discovery is also attempted. |
+| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `30` | Continuous local archive poll interval; minimum 30 seconds. |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED` | `True` | When raw sync is authorized, register only fresh inbound exact @mentions as expiring dispatcher candidates if UI capture is unavailable. |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS` | `300` | Maximum raw-message age eligible for the exact-mention fallback; 30–900 seconds. |
 | `WO_LOG_LEVEL` | `INFO` | loguru level. |
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | Python logging level for wx4py internals; set to `INFO` only when debugging UI automation. |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root. |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token. |
+| `WO_INGEST_BACKEND` | `weflow` | `weflow` or visible-UI `wx4py`. |
 | `WO_BOT_NAME` | empty | Bot's group nickname. Required by dispatcher. |
 | `WO_BOT_WXID` | empty | Optional bot wxid for reply-to-bot trigger. |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM provider adapter. |
@@ -471,6 +631,21 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_DISPATCHER_WORKER_THREADS` | `4` | Global message workers. Messages are serialized per group but different groups can run in parallel; wx4py sends remain serialized. |
 | `WO_DISPATCHER_CANDIDATE_LIMIT` | `500` | `/find` candidate cap. |
 | `WO_DISPATCHER_CONTEXT_CHAT` | `2500` | Legacy chat context cap, still used by some summary paths. |
+| `WO_HOURLY_SUMMARY_ENABLED` | `False` | Idempotently summarize the previous completed clock hour after the grace period. |
+| `WO_HOURLY_SUMMARY_MIN_MESSAGES` | `5` | Skip an hourly summary below this effective-message count. |
+| `WO_DAILY_SUMMARY_ENABLED` | `False` | At startup/midnight, idempotently summarize the previous Asia/Hong_Kong natural day. |
+| `WO_DAILY_SUMMARY_MIN_MESSAGES` | `5` | Skip automatic summary below this effective-message count. |
+| `WO_DAILY_SUMMARY_CHUNK_CHARS` | `800` | Maximum characters per outbound summary part. |
+| `WO_DAILY_SUMMARY_SEND_DELAY_SECONDS` | `1.2` | Delay between outbound summary parts. |
+| `WO_SUMMARY_TIMEZONE` | `Asia/Hong_Kong` | IANA timezone used for hourly and natural-day boundaries. |
+| `WO_SUMMARY_SYNC_GRACE_SECONDS` | `300` | Wait after a period closes so local DB sync can catch up. |
+| `WO_SUMMARY_GENERATION_LEASE_SECONDS` | `900` | Crash-recovery lease for summary generation. |
+| `WO_SUMMARY_SENDING_LEASE_SECONDS` | `300` | After this sending lease expires, delivery becomes unknown and is never auto-retried. |
+| `WO_MEMBER_KB_ENABLED` | `False` | Opt in to full-history and hourly evidence-linked member profiling. |
+| `WO_MEMBER_KB_INTERVAL_SECONDS` | `3600` | Minimum member-profile scheduler interval. Mature hourly work still observes the summary sync grace. |
+| `WO_MEMBER_KB_CHUNK_CHARS` | `24000` | Approximate input-character budget for one member/profile model call. |
+| `WO_MEMBER_KB_MAX_CONCURRENCY` | `2` | Maximum concurrent per-member model calls. |
+| `WO_MEMBER_KB_RETRIES` | `3` | Retry count for a profile chunk; cursors advance only after an atomic successful write. |
 | `WO_LLM_MAX_TOKENS` | `5000` | General output cap. |
 | `WO_LLM_CHAT_MAX_TOKENS` | empty | Overrides chat cap. |
 | `WO_LLM_SUM_MAX_TOKENS` | empty | Overrides summary cap. |
@@ -489,13 +664,13 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_AGENT_CONTINUATION_DELAY_SECONDS` | `90` | Default delay before reevaluating a scheduled follow-up. |
 | `WO_AGENT_CONTINUATION_TTL_SECONDS` | `600` | Expiry window for pending follow-ups. |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | Per-group probability cooldown. |
-| `WO_AGENT_MAX_STEPS` | `8` | Native Phase A max rounds. |
+| `WO_AGENT_MAX_STEPS` | `4` | Native Phase A max rounds; bounded for interactive latency. |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B max rounds. |
-| `WO_AGENT_REFLECTION_ENABLED` | `True` | Enables chat Phase B memory reflection. |
+| `WO_AGENT_REFLECTION_ENABLED` | `False` | Enables synchronous chat Phase B reflection; keep off for reply-first operation and use lurk for background learning. |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | Persona YAML directory. |
-| `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | Initial recent-message window for agent chat. |
-| `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | Hard cap for `group_memory`. |
-| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `20` | Native Phase A tool budget. |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `40` | Initial recent-message window for agent chat. |
+| `WO_AGENT_MEMORY_MAX_CHARS` | `12000` | Compact group culture/rules/topics memory cap; member facts belong in member-kb. |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `8` | Native Phase A total tool budget. |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Native Phase A per-step tool budget. |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Native image-read budget. |
 | `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Native voice-read budget. |
@@ -508,10 +683,17 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_OPENCLAW_TOKEN` | empty | OpenClaw gateway token. |
 | `WO_OPENCLAW_AGENT_ID` | `wechat-bot` | OpenClaw agent id. |
 | `WO_OPENCLAW_TIMEOUT_SECONDS` | `300` | OpenClaw gateway request timeout. |
-| `WO_AGENT_BACKEND` | `native` | `native` or `openclaw`. |
+| `WO_PI_EXECUTABLE` | `pi` | Pi CLI executable. |
+| `WO_PI_PROVIDER` | `opencode-go` | Pi provider; credentials remain owned by Pi. |
+| `WO_PI_MODEL` | `deepseek-v4-flash` | Pi model. |
+| `WO_PI_THINKING` | `low` | Pi thinking level. |
+| `WO_PI_TIMEOUT_SECONDS` | `300` | Per-call Pi RPC timeout. |
+| `WO_AGENT_BACKEND` | `native` | `native`, `openclaw`, or `pi`. |
 | `WO_REPLY` | `True` | Send replies back to WeChat. |
-| `WO_REPLY_BACKEND` | `wx4py` | `wx4py` or `stdout`. |
+| `WO_REPLY_BACKEND` | `uia-direct` | `uia-direct` (no mouse), `wx4py` (ordinary visible UI automation), or `stdout`. |
 | `WO_REPLY_MENTION_POLICY` | `explicit` | `always` mentions the requester on every group reply; `explicit` mentions only direct/command/reply triggers; `never` sends plain group messages. |
+| `WO_REPLY_ALLOWED_GROUPS` | `[]` | Exact display names allowed for UI sends; empty blocks both UI backends. |
+| `WO_REPLY_FAIL_CLOSED` | `True` | Refuse startup/send instead of silently degrading after wx4py failure. |
 
 `WO_WHISPER_MODEL` is read directly by the mm worker and defaults to `small`; accepted values depend on faster-whisper, commonly `tiny`, `base`, `small`, `medium`, and `large-v3`.
 
@@ -545,13 +727,15 @@ uv run wechat-oracle agent show-runs <group_id> -n 20
 
 ## Development
 
-This repository currently has no pytest, ruff, mypy, or CI test suite. Use the local checks below before committing:
+The repository has a pytest suite. Use the local checks below before committing:
 
 ```powershell
+uv run pytest -q
 uv run python -m compileall src\wechat_oracle
+uv run python -m compileall experimental\raw_wechat
 uv run wechat-oracle agent --help
 uv run wechat-oracle status
-uv run python .Codex\hooks\check_doc_sync.py
+uv run python .claude\hooks\check_doc_sync.py
 git diff --check
 ```
 

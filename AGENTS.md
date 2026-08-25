@@ -2,9 +2,29 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## Raw WeChat synchronization invariant
+
+Discover every numeric `message_N.db` shard; keep `Name2Id` and fallback local-message ids shard-local. Once the contact database verifies a real `@chatroom` id, register it as the canonical alias for display-name-derived UI ingestion. Raw history and UI live rows for one group must share dispatcher context and must not create duplicate daily summaries. Stable snapshots require an unchanged DB/WAL copy window, valid WAL checksums through the last commit marker, page HMAC verification, and SQLite `quick_check`; raw keys and chat data never enter Git or logs.
+
+## No-mouse UIA reply invariant
+
+`WO_REPLY_BACKEND=uia-direct` must attach passively without invoking wx4py's registry-repair/restart connection path, open only an exact `session_item_<group>` or unique exact search result through UI Automation accessibility actions, verify the same session and chat-input focus immediately before submission, and fail closed on ambiguity. Its implementation must never call `Click`, `DoubleClick`, or wx4py's public `send_to()` path. It may use focused keyboard input, but only while Windows is unlocked and the exact display-name allowlist permits the group. Interactive/manual real-send tests still require a single-group, single-message action-time confirmation. Hourly/daily summaries may run unattended only after the user persistently enables that schedule and selects both an exact canonical `@chatroom` id and its exact display-name send allowlist; an uncertain send is quarantined and never retried automatically.
+
+## Windows portable build invariant
+
+`packaging/wechat-oracle.spec` produces a console-mode Windows x64 `onedir` package. Frozen child processes must launch through the current executable, and the package must include `schema.sql`, the production `wechat_oracle.raw_wechat` code, cryptography support, local OCR/VAD assets, CTranslate2/ONNX Runtime DLLs, and Textual's lazy modules. It must never bundle `.env`, `data/`, personas, logs, raw/decrypted WeChat databases or keys, or anything under `experimental/`; portable mutable state remains beside the executable. Keep wx4py's AGPL-3.0-or-later license in the output, and review redistribution obligations before publishing a binary.
+
+## Member knowledge invariant
+
+Per-member knowledge is keyed by `(canonical group_id, sender_wxid)` and never linked across groups. `messages` remains the only raw-message store; claims reference evidence message IDs that must belong to the same group/member and the exact model-input batch. Missing sender IDs go only to the per-group `__unknown__` bucket and must not personalize a named member. Manual section locks win over model output, and superseded/deleted claims remain auditable. Profile/cursor/evidence updates commit atomically; no failed or invalid model response may advance a cursor. Enabling and saving the feature must automatically start/resume full-history bootstrap; mature hourly member work runs before the corresponding summary. Summary attribution must retain reliable sender nicknames, never guess missing identities, and use the shared light/playful tone policy from `prompts.py`. Persistent all-member broadcasts snapshot eligible members, use deterministic per-item outbox markers, never retry sent/unknown outcomes after restart, and yield to scheduled-summary grace windows.
+
+## Interactive reply latency invariant
+
+The native mention path is reply-first: synchronous Phase B reflection stays disabled by default, Phase A has a small bounded round/tool budget, and the initial recent-message window stays compact. Group culture/rules/shared topics may be learned by low-frequency lurk; per-member facts stay in member-kb and must not bloat `group_memory`. Member bootstrap queues at most the configured worker capacity instead of preloading a whole group. Same-group replies remain FIFO for conversational consistency, so every new blocking model round directly multiplies queue delay. Preserve `dispatcher.claim` plus `dispatcher.start.queue_wait_ms` and agent/reply duration events when changing scheduling.
+
 ## 架构一句话
 
-三个独立进程（`ingest live` / `dispatcher` / `ingest backfill`）共享一份 WAL 模式的 SQLite (`data/wechat-oracle.db`)。**WeFlow 的 HTTP API 是上游唯一真相源**——live 走 SSE 推流，backfill 导 WeFlow JSON 导出，没有路径直连微信原始 DB。dispatcher 轮询 DB，命中 `@<bot>` 文本后过 OpenAI-compatible LLM，再用 wx4py（Windows UI 自动化）把回复打回群。
+采集进程（WeFlow SSE、wx4py 可见 UI，或用户显式授权的本机微信只读同步）与 `dispatcher` 共享一份 WAL 模式 SQLite (`data/wechat-oracle.db`)。本机原库路径必须先产生稳定、验证通过的临时快照，只把用户精确选择群的规范化 `Message` 经 `ingest/writer.py:write_messages` 写入本地记忆库。dispatcher 使用 OpenAI-compatible API 处理 @ 回复与定时摘要，再用串行、精确白名单约束的 UIA 发送器回群；首版配置界面只提供 native SQLite + OpenAI-compatible API，不依赖 Pi Agent。
 
 数据形态：`messages`（主表）+ `forwarded_records`（合并转发子项，`parent_msg_id` 反指）+ `command_runs`（dispatcher 幂等记录，`msg_id` 主键）。所有写入路径必须走 `ingest/writer.py:write_messages`，靠 `UNIQUE(dedupe_key)` 跨源去重。详细字段语义看 `schema.sql`（DDL 行级注释是主源）+ `models.py` docstring。
 
@@ -22,6 +42,8 @@ uv run wechat-oracle status            # 查总条数 / 按 status / 按群分�
 
 ```bash
 uv run wechat-oracle ingest live                                 # SSE 实时抓 → DB
+uv run wechat-oracle ingest ui-probe <群名>                      # 只读 UIA 兼容性探针
+uv run wechat-oracle ingest ui-live                              # 可见 UI 文本/链接 → DB
 uv run wechat-oracle dispatcher                                  # DB 轮询 → LLM → wx4py 回群
 uv run wechat-oracle ingest backfill <path.json> --format weflow # 一次性导入 WeFlow JSON 导出
 ```
@@ -35,11 +57,11 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 
 封装好的 wrapper（POSIX）：`scripts/import.sh <export.json>` / `scripts/track.sh`；Windows 对应 `.bat` 同名文件。
 
-**测试 / lint：本项目当前没有 pytest、ruff、mypy 或任何 CI 配置**——`pyproject.toml` 里没有 dev-dependencies 段，仓库里也没有 `tests/`。改代码要自验，靠跑上面那几条 + 看 `data/dispatcher.log` / `data/llm_debug.log`。要加单测的话先和用户对一下要不要顺便引一套 pytest。
+**测试 / lint**：项目使用 pytest（`uv run pytest -q`），并保留 `compileall`、`uv pip check`、`wechat-oracle doctor` 与 `.claude/hooks/check_doc_sync.py --pre-commit` 作为本地审计闸门。涉及 Windows UI 的真实发送仍需在解锁桌面上做单群、单消息验证。
 
 ## 平台前提
 
-**生产环境是 Windows + 中文 WeChat 4.1.x（Qt 版）+ WeFlow 桌面端**——wx4py 走 UI 自动化只在 Windows 工作，dispatcher 的「发回群」分支在 macOS/Linux 上跑不起来。但**导入 / 查询 / DB 操作（init-db / backfill / status / weflow find）跨平台**，本仓库的 dev worktree 多半就在 macOS 上。改 dispatcher 时如果 Windows 不在手边，至少要确保 `parse_command` / SQL 构造 / LLM 调用这些纯逻辑路径能在本地手动 invoke 验证。
+**生产环境是 Windows + 中文 WeChat 4.1.x（Qt 版）**。官方 WeFlow 当前可能不可用，因此 `WO_INGEST_BACKEND=wx4py` 是受限回退：只读取 UI 暴露的文本/链接，无法可靠取得发送者身份。dispatcher 的发送分支只在 Windows 可用；导入、查询、DB 与纯逻辑测试仍应跨平台。
 
 ## 文档导航（新会话先读这段）
 
@@ -74,7 +96,8 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 - **数据本地优先**：`data/` 是项目自有归档，导入时把媒体复制进来（`data/media/<group_id>/<kind>/`），不留对外部路径的依赖。
 - **跨源去重**：所有写入路径走 `write_messages()` → `UNIQUE(dedupe_key)`，新增 importer 时复用、不要绕过。
 - **`source` 字段记录管道来源**（`live` / `backfill`），不要用它表达消息状态——状态走 `status` 列。
-- **WeFlow 是唯一真相源**：实时抓和历史回灌都过 WeFlow，不直接读微信原始 DB。
+- **数据源分层**：生产支持 WeFlow、wx4py 可见 UI，以及默认关闭的 `wechat_oracle.raw_wechat` 本机只读同步。原库同步只能处理用户精确授权的 canonical `@chatroom` 群，并始终通过 `write_messages()` 进入主归档。
+- **本机原库边界**：只处理当前用户明确指定的本机账号与群；先复制到隔离工作目录并只读分析；不得修改微信文件或注入/补丁微信进程；密钥、进程转储、原始 DB、解密 DB 和个人聊天内容一律 gitignore，日志只能记录匿名账号指纹、计数和校验状态；功能必须由默认关闭的显式开关启用；临时全库明文快照在规范化导入后删除；模块本身不得拥有发送微信消息的能力。
 - **dispatcher 冷启动不回放历史**：`_skip_backlog` 在启动时把所有未处理的 `@bot` 历史消息标 `(startup-skip)`，避免冷启动 / 大批量回灌后向群灌一通陈年答复。改这个行为要同步 README 数据流段。
 
 ## 易漂移点速查
@@ -98,8 +121,11 @@ uv run wechat-oracle weflow sessions --groups-only          # 列出所有 @chat
 | F13 | dispatcher `_skip_backlog` 启动行为 | `dispatcher.py:_skip_backlog` + `README.md` 数据流细节段 | — | 改默认行为（比如改成处理积压）必须同步 README + 给个 flag |
 | F15 | `messages.transcript` 语义（OCR/ASR 出口）+ LLM 可见标签 | `schema.sql` 注释 + `models.py:Message.transcript` docstring + `worker/mm.py` 状态机注释 + `dispatcher.py:fetch_candidates` SQL CASE 拼接逻辑 + 两条 system prompt（`_CHAT_SYSTEM_PROMPT` / `_SYSTEM_PROMPT`）里描述的标签形状 + `README.md` 多媒体识别段 | hook (schema.sql 改触发) | 三态：`NULL` 待处理 / `''` 已处理无文字（不重试） / `'<text>'` 成功。**LLM 可见标签**：有 transcript 时是 `[图片·OCR] xxx`/`[语音·ASR] xxx`（中点 `·` 区分 "已识别" vs "事件占位"），无 transcript 仅 `[图片]`/`[语音]`。改 SQL CASE 的标签形状 → 必须同时改两条 prompt 的格式说明，否则 LLM 看不懂会答"群里没出现过相关讨论" |
 | F14 | 本 hook 的 marker 列表 | `.Codex/hooks/check_doc_sync.py:_*_MARKERS` + 本文件「命令体系维护契约」判定标准段 | — | 改 marker 时把 prose 描述也改了，否则 hook 和契约说的不是一回事 |
-| F15 | `WO_REPLY_BACKEND` 取值集 (`wx4py` / `stdout`) | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher。**Tencent iLink Bot 不在列表里**——实测不可群发，见 README「实验记录」 |
+| F15 | `WO_REPLY_BACKEND` 取值集 (`uia-direct` / `wx4py` / `stdout`) | `replier.py:build_replier` if-chain + `config.py:reply_backend` 注释 + `README.md` 配置参考表 | hook (config.py 改触发) | 加新 backend 时把这三处都同步；`uia-direct` 还必须遵守本文「No-mouse UIA reply invariant」；新建一个 `XxxReplier` 类实现 `Replier` 协议即可，不动 dispatcher。**Tencent iLink Bot 不在列表里**——实测不可群发，见 README「实验记录」 |
 | F18 | OpenClaw backend stack | `config.py:agent_backend/openclaw_*` + `llm.py:OpenClawChatCompletions/OpenClawCompletionLLM` + `agent/backend.py` + `agent/backends/openclaw.py` + `agent/orchestrator.py:chat_via_lurk` + `mcp_server.py` + `cli.py:openclaw_app` + `scripts/register_mcp.ps1` + `scripts/register_mcp.sh` + `examples/openclaw/*` + `README.md` OpenClaw setup | — | OpenClaw runs on Windows from the same checkout and normal project `.venv`. MCP tools take explicit `group_id`; keep group isolation and read-before-write memory semantics aligned with native tools. In `WO_AGENT_BACKEND=openclaw`, chat triggers, Local Ask, slash-command text/JSON completions, and lurk reflection all use the OpenClaw gateway. MCP `load_image(group_id, msg_id)` returns the raw image as a FastMCP `Image` content block so the wechat-bot agent's own vision sees pixels directly. MCP `read_image(group_id, msg_id, prompt?)` mirrors native `ReadImageTool`: it uses configured `WO_VISION_*` and returns text. |
+| F19 | 授权式微信原库读取 | `src/wechat_oracle/raw_wechat/` + `config.py` + `cli.py` + `.gitignore` + `README.md` + 本文件「本机原库边界」 | — | 默认关闭、精确账号/群授权、稳定只读副本、密钥与聊天原文不落日志/不进 Git；任何导入仍统一走 `write_messages()`。 |
+| F20 | 分群成员知识库 | `schema.sql` + `member_knowledge.py` + `member_broadcast.py` + Agent 只读工具 + summary context + `config.py` + `cli.py:member-kb` + `README.md` + 本文件「Member knowledge invariant」 | — | 原话不复制；证据必须同群同成员；未知成员不个性化；锁定栏目不可覆盖；失败不推进游标；画像发送只允许完成建档的非 UNKNOWN 成员，须精确群授权、`--yes` 并复用 outbox；全员任务持久化、成功项不重发并让路定时总结。 |
+| F21 | 一次性摘要真实发送 | `cli.py:summary send-once` + `daily_summary.py` + `replier.py:build_replier(force_send=...)` + `README.md` | — | 必须精确群授权和 `--yes`；复用 outbox 幂等状态机；`--start/--end` 成对、按 summary timezone 且 end-exclusive；只有无发送记录的 failed/skipped 可显式重试。 |
 
 **新事实进表的判定**：如果你引入了一个事实它**注定要在两个以上文件里出现**（即使本仓库现在只放在了一处），就把它登记到本表，并尽量用单源 + import 替代多处复制。
 

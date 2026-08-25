@@ -75,6 +75,7 @@ from .llm import (
 from .log_utils import append_event, append_log, dump_llm_call
 from .message_render import render_message_body, render_quote_suffix
 from .replier import Replier, build_replier
+from .time_ranges import parse_natural_time_range
 
 
 # ---------- Shared types ----------
@@ -585,7 +586,7 @@ class AskCommand(Command):
 @register
 class SumCommand(Command):
     name = "sum"
-    usage = "/sum [from:<人>|@<人>] [since:YYYY[-MM[-DD]]] [limit:N] [主题]"
+    usage = "/sum [from:<人>|@<人>] [since:日期] [until:日期] [limit:N] [主题]"
     description = "总结当前群的一段聊天；可按人、时间和主题收窄"
     examples = [
         "/sum",
@@ -594,9 +595,10 @@ class SumCommand(Command):
         "/sum from:张三 limit:100",
     ]
 
-    def __init__(self, target: str | None, since_t: int | None, limit: int | None, topic: str):
+    def __init__(self, target: str | None, since_t: int | None, until_t: int | None, limit: int | None, topic: str):
         self.target = target
         self.since_t = since_t
+        self.until_t = until_t
         self.limit = limit
         self.topic = topic
 
@@ -605,6 +607,7 @@ class SumCommand(Command):
         s = args.strip()
         target: str | None = None
         since_t: int | None = None
+        until_t: int | None = None
         limit: int | None = None
 
         while s:
@@ -638,6 +641,20 @@ class SumCommand(Command):
                     )
                 s = rest
                 continue
+            if first.startswith("until:"):
+                if until_t is not None:
+                    return ParseError("/sum 重复指定 until:", show_help=cls)
+                raw = first[len("until:"):].strip()
+                parsed = parse_natural_time_range(raw)
+                if parsed is None:
+                    parsed_t = _parse_since(raw)
+                    if parsed_t is None:
+                        return ParseError(f"until:{raw} 格式错误", show_help=cls)
+                    until_t = parsed_t
+                else:
+                    until_t = parsed.end_t
+                s = rest
+                continue
             if first.startswith("limit:"):
                 if limit is not None:
                     return ParseError("/sum 重复指定 limit:", show_help=cls)
@@ -649,21 +666,31 @@ class SumCommand(Command):
                 continue
             break
 
-        return cls(target=target, since_t=since_t, limit=limit, topic=s.strip())
+        return cls(target=target, since_t=since_t, until_t=until_t, limit=limit, topic=s.strip())
+
+    @classmethod
+    def from_natural(cls, body: str) -> "SumCommand":
+        text = re.sub(r"^总结(?:一下|下)?", "", body).strip()
+        parsed = parse_natural_time_range(text)
+        if parsed is None:
+            return cls(target=None, since_t=None, until_t=None, limit=None, topic=text)
+        topic = re.sub(r"^(?:的)?(?:群聊|聊天|消息|内容)?(?:聊了什么|说了什么|讨论了什么)?[，,。 ]*", "", parsed.remaining_text)
+        return cls(None, parsed.start_t, parsed.end_t, None, topic.strip())
 
     def execute(self, ctx: CommandContext) -> ExecResult:
-        limit = self.limit or min(ctx.candidate_limit_chat, 500)
+        limit = self.limit
         cands = fetch_candidates(
             ctx.conn,
             group_id=ctx.group_id,
             target=self.target,
             since_t=self.since_t,
+            until_t=self.until_t,
             limit=limit,
             bot_name=ctx.bot_name,
         )
         if not cands:
             return ExecResult(stdout="/sum: no candidates", chat="没有可总结的群聊消息。", summary="sum: empty")
-        reply = summarize_chat(
+        reply = summarize_chat_hierarchical(
             ctx.llm,
             ctx.model,
             cands,
@@ -935,6 +962,9 @@ def parse_command(content_text: str | None, bot_name: str) -> Command | ParseErr
             return ParseError(reason=f"未知命令 /{cmd_name}", show_help=None)
         return cmd_cls.parse(args)
 
+    if re.match(r"^总结(?:一下|下)?(?:\s|今天|昨天|前天|最近|\d{4})", body):
+        return SumCommand.from_natural(body)
+
     # Fallback: free-form @<bot> question/topic → ChatCommand
     return ChatCommand.parse(body)
 
@@ -993,10 +1023,11 @@ def fetch_candidates(
     group_id: str,
     target: str | None,
     since_t: int | None,
-    limit: int,
+    limit: int | None,
     bot_name: str | None = None,
     *,
     for_chat: bool = False,
+    until_t: int | None = None,
 ) -> list[Candidate]:
     """Recent messages from `group_id`, most recent first capped at `limit`.
 
@@ -1046,17 +1077,22 @@ def fetch_candidates(
           LEFT JOIN messages orig
                  ON orig.wx_msg_id = m.reply_to_wx_msg_id
                 AND orig.group_id  = m.group_id
-         WHERE m.group_id = ?
+         WHERE (m.group_id = ? OR m.group_id IN (
+                   SELECT alias_id FROM group_aliases WHERE canonical_group_id = ?
+               ))
     """
-    main_params: list[object] = [group_id]
+    main_params: list[object] = [group_id, group_id]
     if target is not None:
         main_sql += " AND (m.sender_display = ? OR m.sender_wxid = ?)"
         main_params.extend([target, target])
     if since_t is not None:
         main_sql += " AND m.t >= ?"
         main_params.append(since_t)
+    if until_t is not None:
+        main_sql += " AND m.t < ?"
+        main_params.append(until_t)
     if bot_name:
-        main_sql += " AND m.sender_display != ?"
+        main_sql += " AND (m.sender_display IS NULL OR m.sender_display != ?)"
         main_params.append(bot_name)
         if not for_chat:
             # /find: drop slash-command messages from the candidate pool —
@@ -1077,16 +1113,21 @@ def fetch_candidates(
                f.content AS fwd_content
           FROM forwarded_records f
           JOIN messages m ON m.msg_id = f.parent_msg_id
-         WHERE m.group_id = ?
+         WHERE (m.group_id = ? OR m.group_id IN (
+                   SELECT alias_id FROM group_aliases WHERE canonical_group_id = ?
+               ))
            AND f.content IS NOT NULL AND f.content <> ''
     """
-    fwd_params: list[object] = [group_id]
+    fwd_params: list[object] = [group_id, group_id]
     if target is not None:
         fwd_sql += " AND f.sender_display = ?"
         fwd_params.append(target)
     if since_t is not None:
         fwd_sql += " AND f.t >= ?"
         fwd_params.append(since_t)
+    if until_t is not None:
+        fwd_sql += " AND f.t < ?"
+        fwd_params.append(until_t)
 
     sql = f"""
         SELECT * FROM (
@@ -1094,9 +1135,12 @@ def fetch_candidates(
             UNION ALL
             {fwd_sql}
         )
-        ORDER BY t DESC LIMIT ?
+        ORDER BY t DESC
     """
-    params = main_params + fwd_params + [limit]
+    params = main_params + fwd_params
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     rows.reverse()  # chronological for the LLM
     candidates: list[Candidate] = []
@@ -1295,6 +1339,81 @@ def summarize_chat(
             user=user,
             raw=raw,
             parsed=None,
+        )
+    return raw
+
+
+def summarize_chat_hierarchical(
+    client: LLMClient,
+    model: str,
+    context: list[Candidate],
+    topic: str,
+    log_path: Path | None = None,
+    *,
+    chunk_messages: int = 500,
+    chunk_chars: int = 25_000,
+) -> str:
+    """Summarize an uncapped period in bounded leaf chunks, then merge."""
+    chunks: list[list[Candidate]] = []
+    current: list[Candidate] = []
+    current_chars = 0
+    for cand in context:
+        size = len(cand.content) + len(cand.sender) + 40
+        if current and (len(current) >= chunk_messages or current_chars + size > chunk_chars):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(cand)
+        current_chars += size
+    if current:
+        chunks.append(current)
+    if len(chunks) <= 1:
+        return summarize_chat(client, model, context, topic, log_path)
+
+    partials = [summarize_chat(client, model, chunk, topic, log_path) for chunk in chunks]
+    round_no = 1
+    while len(partials) > 1:
+        merged: list[str] = []
+        batch: list[str] = []
+        chars = 0
+        for part in partials:
+            # Never flush a one-item batch solely because the next item would
+            # exceed the char target: that would keep the number of partials
+            # unchanged forever when individual model outputs are oversized.
+            if len(batch) >= 2 and chars + len(part) > chunk_chars:
+                merged.append(_merge_summary_batch(client, model, batch, topic, round_no, log_path))
+                batch, chars = [], 0
+            batch.append(part)
+            chars += len(part)
+        if batch:
+            merged.append(_merge_summary_batch(client, model, batch, topic, round_no, log_path))
+        partials = merged
+        round_no += 1
+    return partials[0]
+
+
+def _merge_summary_batch(
+    client: LLMClient,
+    model: str,
+    parts: list[str],
+    topic: str,
+    round_no: int,
+    log_path: Path | None,
+) -> str:
+    user = (
+        f"主题：{topic or '不限主题'}\n"
+        "请合并以下分段摘要，去重并保留时间顺序、结论、分歧、决定和待办。"
+        "最终输出约 1200 个中文字符，不要补充原文没有的信息。\n\n"
+        + "\n\n".join(f"分段 {i + 1}：\n{part}" for i, part in enumerate(parts))
+    )
+    raw = client.complete_text(
+        model=model, system=prompts.SUM_SYSTEM, user=user,
+        temperature=0.2, max_tokens=settings.sum_max_tokens,
+    ).strip()
+    if log_path:
+        dump_llm_call(
+            log_path, label=f"/sum-merge-{round_no}", system=prompts.SUM_SYSTEM,
+            user=user, raw=raw, parsed=None,
         )
     return raw
 
@@ -1920,7 +2039,7 @@ def _next_unprocessed(
     bot_wxid: str | None = None,
     batch: int = 20,
 ) -> list[sqlite3.Row]:
-    """Oldest `batch` live messages with no command_runs row yet, globally.
+    """Oldest `batch` live/fresh-fallback messages without a run, globally.
 
     `_GlobalScheduler` serializes processing per group while allowing
     different groups to run in parallel. `_GlobalScheduler.submit` claims rows
@@ -1937,7 +2056,7 @@ def _next_unprocessed(
     can drift if you rename the bot in-group).
     """
     own_wxid_clause = ""
-    params: list[object] = [bot_name]
+    params: list[object] = [time.time(), bot_name]
     if bot_wxid:
         own_wxid_clause = "AND (m.sender_wxid IS NULL OR m.sender_wxid != ?)"
         params.append(bot_wxid)
@@ -1949,7 +2068,8 @@ def _next_unprocessed(
                m.quote_text, m.reply_to_wx_msg_id, m.wx_msg_id
           FROM messages m
      LEFT JOIN command_runs r ON r.msg_id = m.msg_id
-         WHERE m.source = 'live'
+     LEFT JOIN raw_reply_candidates rc ON rc.msg_id = m.msg_id
+         WHERE (m.source = 'live' OR rc.expires_at >= ?)
            AND m.type != 'system'
            AND r.msg_id IS NULL
            AND (m.sender_display IS NULL OR m.sender_display != ?)
@@ -1962,11 +2082,21 @@ def _next_unprocessed(
 
 
 def _build_llm_client() -> LLMClient:
-    if (settings.agent_backend or "native").lower() == "openclaw":
+    backend = (settings.agent_backend or "native").lower()
+    if backend == "openclaw":
         return OpenClawCompletionLLM(
             gateway_url=settings.openclaw_gateway_url,
             token=settings.openclaw_token,
             agent_id=settings.openclaw_agent_id,
+        )
+    if backend == "pi":
+        from .llm import PiRpcLLM
+        return PiRpcLLM(
+            executable=settings.pi_executable,
+            provider=settings.pi_provider,
+            model=settings.pi_model,
+            thinking=settings.pi_thinking,
+            timeout_seconds=settings.pi_timeout_seconds,
         )
     native = build_llm_client(
         provider=settings.llm_provider,
@@ -2639,6 +2769,7 @@ class _GlobalScheduler:
         with get_conn() as conn:
             if not _claim(conn, msg_id):
                 return False
+            row_dict["_queued_at"] = time.time()
             append_event("dispatcher.claim", **_row_event_fields(row_dict))
 
         next_row: dict[str, object] | None = None
@@ -2668,6 +2799,7 @@ class _GlobalScheduler:
                 return False
             work = dict(claimed)
             work["_work_type"] = "followup"
+            work["_queued_at"] = time.time()
             append_event(
                 "continuation.claim",
                 job_id=job_id,
@@ -2745,6 +2877,18 @@ class _GlobalScheduler:
     def _handle(self, group_key: str, row: dict[str, object]) -> None:
         work_type = row.get("_work_type") or "message"
         msg_id = int(row["msg_id"]) if "msg_id" in row else -int(row["job_id"])
+        queued_at = float(row.get("_queued_at") or time.time())
+        event_fields: dict[str, object] = {
+            "group_id": row.get("group_id"),
+            "group_name": row.get("group_name"),
+            "work_type": work_type,
+            "queue_wait_ms": round((time.time() - queued_at) * 1000, 3),
+        }
+        if work_type == "followup":
+            event_fields["job_id"] = int(row["job_id"])
+        else:
+            event_fields["msg_id"] = msg_id
+        append_event("dispatcher.start", **event_fields)
         try:
             try:
                 with get_conn() as conn:
@@ -2966,6 +3110,47 @@ def run_dispatcher() -> None:
             if settings.agent_lurk_enabled else None
         )
         next_lurk_check = time.time() + max(1, settings.agent_lurk_interval_seconds)
+        summary_scheduler = None
+        next_summary_check = 0.0
+        member_kb_scheduler = None
+        member_broadcast_scheduler = None
+        next_member_kb_check = 0.0
+        next_member_broadcast_check = 0.0
+        member_kb_summary_wait_started: float | None = None
+        if settings.member_kb_enabled:
+            from .member_knowledge import MemberKnowledgeScheduler
+
+            member_kb_scheduler = MemberKnowledgeScheduler(
+                db_path=settings.db_path,
+                llm_factory=_build_llm_client,
+                settings_like=settings,
+                grace_seconds=settings.summary_sync_grace_seconds,
+                max_workers=settings.member_kb_max_concurrency,
+            )
+            logger.warning(
+                "member knowledge enabled: archived group text and derived profiles are sent to the configured model API; "
+                "sensitive inferences may be used in replies and summaries"
+            )
+            from .member_broadcast import MemberProfileBroadcastScheduler
+            member_broadcast_scheduler = MemberProfileBroadcastScheduler(
+                db_path=settings.db_path,
+                replier=replier,
+            )
+        if settings.hourly_summary_enabled or settings.daily_summary_enabled:
+            from .daily_summary import SummaryScheduler
+            summary_scheduler = SummaryScheduler(replier=replier, llm_factory=_build_llm_client)
+            # The first loop after a restart must run the idempotent summary
+            # recovery/due check immediately.  Otherwise a freshly submitted
+            # member bootstrap can postpone an already-mature hour by another
+            # full five-minute head-start window.
+            member_kb_summary_wait_started = time.time() - 300
+            logger.info(
+                "automatic summaries enabled: hourly={} daily={} timezone={} grace={}s",
+                settings.hourly_summary_enabled,
+                settings.daily_summary_enabled,
+                settings.summary_timezone,
+                settings.summary_sync_grace_seconds,
+            )
         if lurk_scheduler is not None:
             logger.info(
                 "lurk scheduler enabled: interval={}s min_new={} batch={}",
@@ -2975,6 +3160,55 @@ def run_dispatcher() -> None:
             )
         try:
             while True:
+                now_ts = time.time()
+                member_kb_busy = False
+                if member_kb_scheduler is not None:
+                    if now_ts >= next_member_kb_check:
+                        member_result = member_kb_scheduler.maybe_submit(now_ts)
+                        next_member_kb_check = now_ts + min(
+                            60, max(1, settings.member_kb_interval_seconds)
+                        )
+                        submitted_members = int(member_result.get("submitted", 0))
+                        if submitted_members:
+                            if member_kb_summary_wait_started is None:
+                                member_kb_summary_wait_started = now_ts
+                            logger.info(
+                                "member knowledge scheduler submitted {} member job(s)",
+                                submitted_members,
+                            )
+                        if member_result.get("errors"):
+                            logger.warning(
+                                "member knowledge scheduler reported {} sanitized error(s)",
+                                len(member_result["errors"]),
+                            )
+                    member_status = member_kb_scheduler.status()
+                    member_kb_busy = any(
+                        not bool(job.get("done"))
+                        for job in member_status.get("jobs", [])
+                    )
+                    if member_kb_busy and member_kb_summary_wait_started is None:
+                        member_kb_summary_wait_started = now_ts
+                if summary_scheduler is not None and now_ts >= next_summary_check:
+                    # Give profile jobs submitted for this boundary a bounded
+                    # head start, but never let a slow bootstrap/API block
+                    # scheduled summaries indefinitely.
+                    wait_elapsed = (
+                        now_ts - member_kb_summary_wait_started
+                        if member_kb_summary_wait_started is not None
+                        else 0
+                    )
+                    if not member_kb_busy or wait_elapsed >= 300:
+                        summary_scheduler.maybe_submit()
+                        next_summary_check = now_ts + 30
+                        member_kb_summary_wait_started = None
+                    else:
+                        next_summary_check = now_ts + 5
+                if (
+                    member_broadcast_scheduler is not None
+                    and now_ts >= next_member_broadcast_check
+                ):
+                    member_broadcast_scheduler.maybe_submit(now_ts)
+                    next_member_broadcast_check = now_ts + 10
                 rows = _next_unprocessed(
                     conn,
                     settings.bot_name,
@@ -3025,6 +3259,12 @@ def run_dispatcher() -> None:
         except KeyboardInterrupt:
             logger.info("dispatcher stopped by user")
         finally:
+            if summary_scheduler is not None:
+                summary_scheduler.close()
+            if member_kb_scheduler is not None:
+                member_kb_scheduler.close()
+            if member_broadcast_scheduler is not None:
+                member_broadcast_scheduler.close()
             scheduler.close()
             if lurk_scheduler is not None:
                 lurk_scheduler.close()

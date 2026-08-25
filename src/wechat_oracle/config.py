@@ -10,6 +10,7 @@ in CLAUDE.md「易漂移点 F3」 and the doc-sync hook will remind you.
 """
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -38,6 +39,22 @@ class Settings(BaseSettings):
     # WeFlow HTTP API (used by `ingest live`); enable "HTTP API 服务" in WeFlow settings.
     weflow_base_url: str = "http://127.0.0.1:5031"
     weflow_token: str = ""
+    # weflow = official HTTP/SSE API; wx4py = visible WeChat UI only. The UI
+    # fallback cannot recover sender identity and archives only text/link rows.
+    ingest_backend: str = "weflow"
+
+    # Direct local WeChat 4 archive synchronization. This is strictly opt-in
+    # and only imports canonical groups stored in raw_group_authorizations.
+    raw_wechat_enabled: bool = False
+    raw_wechat_account: str = ""
+    raw_wechat_workspace: Path = Field(default=Path("data/raw_wechat"))
+    raw_wechat_install_root: Path = Field(default=Path(r"D:\0softwear\Weixin"))
+    raw_wechat_sync_interval_seconds: float = 30.0
+    # When UI Automation is unavailable, a fresh inbound raw-db @mention may
+    # enter the dispatcher through a short-lived, durable fallback candidate.
+    # Historical rows, outgoing rows and ordinary ambient chat never qualify.
+    raw_wechat_reply_fallback_enabled: bool = True
+    raw_wechat_reply_fallback_max_age_seconds: int = 300
 
     # Dispatcher: bot's @-mention nickname (its 群昵称 in the watched group).
     # Required for `wechat-oracle dispatcher` to recognize commands.
@@ -67,6 +84,28 @@ class Settings(BaseSettings):
     dispatcher_worker_threads: int = 4       # global parallel workers; wx4py send is serialized separately
     dispatcher_candidate_limit: int = 500   # /find candidates per call
     dispatcher_context_chat: int = 2500     # legacy candidate cap for summary-style paths
+
+    # Automatic summaries. Both are opt-in; the grace period gives the local
+    # WeChat database watcher time to publish the final rows for a boundary.
+    hourly_summary_enabled: bool = False
+    hourly_summary_min_messages: int = 5
+    daily_summary_enabled: bool = False
+    daily_summary_min_messages: int = 5
+    daily_summary_chunk_chars: int = 800
+    daily_summary_send_delay_seconds: float = 1.2
+    summary_timezone: str = "Asia/Hong_Kong"
+    summary_sync_grace_seconds: int = 300
+    summary_generation_lease_seconds: int = 900
+    summary_sending_lease_seconds: int = 300
+
+    # Per-group member knowledge. Raw messages remain in `messages`; this
+    # scheduler maintains evidence-linked profiles for each stable sender id.
+    # It is opt-in because message/profile text is sent to the configured LLM.
+    member_kb_enabled: bool = False
+    member_kb_interval_seconds: int = 3600
+    member_kb_chunk_chars: int = 24_000
+    member_kb_max_concurrency: int = 2
+    member_kb_retries: int = 3
 
     # LLM output caps. `llm_max_tokens` is the fallback; specialized values let
     # long-context chat/summaries breathe while keeping short utility commands cheap.
@@ -107,19 +146,25 @@ class Settings(BaseSettings):
     def write_max_tokens(self) -> int:
         return self.llm_write_max_tokens or self.llm_max_tokens
 
+    @property
+    def summary_tz(self) -> ZoneInfo:
+        return ZoneInfo(self.summary_timezone)
+
     # Agent loop (multi-turn tool-calling chat path). Triggers are classified
     # cheaply in dispatcher: direct @, quote-reply to bot, or optional
     # probability wakeups.
     agent_base_probability: float = 0.25       # per-message ambient wake chance
     agent_proactive_mode: str = "reactive"     # off/reactive/proactive probability posture
     agent_cooldown_seconds: int = 30           # min seconds between bot's own utterances per group
-    agent_max_steps: int = 8                   # Phase A read-only loop cap
+    # Keep the interactive path deliberately small. Deep archival work belongs
+    # in member-kb/lurk workers, not in the user's reply critical path.
+    agent_max_steps: int = 4                   # Phase A read-only loop cap
     agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
-    agent_reflection_enabled: bool = True      # off → skip Phase B entirely
+    agent_reflection_enabled: bool = False     # reply first; learn later via lurk/member-kb
     agent_personas_dir: Path = Field(default=Path("data/personas"))
-    agent_recent_context_chat: int = 100       # initial recent-msg window for Phase A system prompt
-    agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
-    agent_max_tool_calls_per_run: int = 20      # Phase A total tool-call budget
+    agent_recent_context_chat: int = 40        # initial recent-msg window for Phase A system prompt
+    agent_memory_max_chars: int = 12_000       # compact group culture/rules/topics only
+    agent_max_tool_calls_per_run: int = 8       # Phase A total tool-call budget
     agent_max_tool_calls_per_step: int = 4      # Phase A per-LLM-turn tool-call budget
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
@@ -152,12 +197,21 @@ class Settings(BaseSettings):
     openclaw_agent_id: str = "wechat-bot"
     openclaw_timeout_seconds: float = 300.0
 
+    # Pi RPC runtime. Pi keeps provider credentials in its own agent directory;
+    # WeChat Oracle only starts the CLI and never reads or copies those secrets.
+    pi_executable: str = "pi"
+    pi_provider: str = "opencode-go"
+    pi_model: str = "deepseek-v4-flash"
+    pi_thinking: str = "low"
+    pi_timeout_seconds: float = 300.0
+
     # Which agent backend dispatcher uses for chat-trigger turns:
     #   native    — in-process Phase A + Phase B with tools (default; works
     #               with just an LLM API key, no extra component to install)
     #   openclaw  — delegate the whole loop to OpenClaw's wechat-bot agent
     #               via /v1/chat/completions (requires WO_OPENCLAW_*; recommended
     #               for production because of subscription pricing)
+    #   pi        — isolated text-only Pi RPC calls, reusing Pi's local auth
     # In openclaw mode, mention/free-chat, slash-command text/JSON completions,
     # and lurk reflection all go through the OpenClaw gateway.
     agent_backend: str = "native"
@@ -167,12 +221,17 @@ class Settings(BaseSettings):
     reply: bool = True
 
     # Reply backend choice. See replier.py for trade-offs.
-    #   wx4py  — UI automation. Requires Windows + WeChat main window visible.
-    #   stdout — No-op. Equivalent to reply=False.
+    #   wx4py     — ordinary UI automation, including mouse control clicks.
+    #   uia-direct — no-mouse UIA selection + focused keyboard submission.
+    #   stdout    — No-op. Equivalent to reply=False.
     # (Tencent iLink Bot was prototyped + rejected; can't deliver group msgs.
     #  See README "实验记录" if you're tempted to try again.)
-    reply_backend: str = "wx4py"
+    reply_backend: str = "uia-direct"
     reply_mention_policy: str = "explicit"  # always/explicit/never group @ policy
+    # Exact display-name allowlist for UI sends. Empty deliberately blocks
+    # UI sends; group ids cannot identify a UI conversation safely.
+    reply_allowed_groups: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    reply_fail_closed: bool = True
 
     @field_validator("groups", mode="before")
     @classmethod
@@ -187,6 +246,11 @@ class Settings(BaseSettings):
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
+    @field_validator("reply_allowed_groups", mode="before")
+    @classmethod
+    def _split_reply_groups(cls, v: object) -> object:
+        return cls._split_csv(v)
+
     @field_validator("agent_proactive_mode")
     @classmethod
     def _validate_agent_proactive_mode(cls, v: str) -> str:
@@ -195,6 +259,64 @@ class Settings(BaseSettings):
             raise ValueError("WO_AGENT_PROACTIVE_MODE must be one of: off, reactive, proactive")
         return mode
 
+    @field_validator("agent_backend")
+    @classmethod
+    def _validate_agent_backend(cls, v: str) -> str:
+        backend = (v or "native").strip().lower()
+        if backend not in {"native", "openclaw", "pi"}:
+            raise ValueError("WO_AGENT_BACKEND must be one of: native, openclaw, pi")
+        return backend
+
+    @field_validator("ingest_backend")
+    @classmethod
+    def _validate_ingest_backend(cls, v: str) -> str:
+        backend = (v or "weflow").strip().lower()
+        if backend not in {"weflow", "wx4py"}:
+            raise ValueError("WO_INGEST_BACKEND must be one of: weflow, wx4py")
+        return backend
+
+    @field_validator("raw_wechat_account")
+    @classmethod
+    def _validate_raw_wechat_account(cls, v: str) -> str:
+        import re
+        value = (v or "").strip().lower()
+        if value and not re.fullmatch(r"[0-9a-f]{12}", value):
+            raise ValueError("WO_RAW_WECHAT_ACCOUNT must be a 12-character fingerprint")
+        return value
+
+    @field_validator("raw_wechat_sync_interval_seconds")
+    @classmethod
+    def _validate_raw_wechat_interval(cls, v: float) -> float:
+        if v < 30:
+            raise ValueError("WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS must be at least 30")
+        return v
+
+    @field_validator("raw_wechat_reply_fallback_max_age_seconds")
+    @classmethod
+    def _validate_raw_wechat_reply_fallback_max_age(cls, v: int) -> int:
+        if not 30 <= v <= 900:
+            raise ValueError(
+                "WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS must be between 30 and 900"
+            )
+        return v
+
+    @field_validator("pi_thinking")
+    @classmethod
+    def _validate_pi_thinking(cls, v: str) -> str:
+        level = (v or "low").strip().lower()
+        if level not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("WO_PI_THINKING has an unsupported level")
+        return level
+
+    @field_validator("pi_provider", "pi_model")
+    @classmethod
+    def _validate_pi_identifier(cls, v: str) -> str:
+        import re
+        value = (v or "").strip()
+        if not value or not re.fullmatch(r"[A-Za-z0-9._/@:+-]+", value):
+            raise ValueError("Pi provider/model contains unsupported shell characters")
+        return value
+
     @field_validator("reply_mention_policy")
     @classmethod
     def _validate_reply_mention_policy(cls, v: str) -> str:
@@ -202,6 +324,52 @@ class Settings(BaseSettings):
         if policy not in {"always", "explicit", "never"}:
             raise ValueError("WO_REPLY_MENTION_POLICY must be one of: always, explicit, never")
         return policy
+
+    @field_validator("summary_timezone")
+    @classmethod
+    def _validate_summary_timezone(cls, v: str) -> str:
+        value = (v or "Asia/Hong_Kong").strip()
+        ZoneInfo(value)
+        return value
+
+    @field_validator(
+        "summary_sync_grace_seconds",
+        "summary_generation_lease_seconds",
+        "summary_sending_lease_seconds",
+    )
+    @classmethod
+    def _validate_summary_seconds(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("summary timing values must be non-negative")
+        return v
+
+    @field_validator("member_kb_interval_seconds")
+    @classmethod
+    def _validate_member_kb_interval(cls, v: int) -> int:
+        if v < 300:
+            raise ValueError("WO_MEMBER_KB_INTERVAL_SECONDS must be at least 300")
+        return v
+
+    @field_validator("member_kb_chunk_chars")
+    @classmethod
+    def _validate_member_kb_chunk_chars(cls, v: int) -> int:
+        if not 4_000 <= v <= 200_000:
+            raise ValueError("WO_MEMBER_KB_CHUNK_CHARS must be between 4000 and 200000")
+        return v
+
+    @field_validator("member_kb_max_concurrency")
+    @classmethod
+    def _validate_member_kb_concurrency(cls, v: int) -> int:
+        if not 1 <= v <= 2:
+            raise ValueError("WO_MEMBER_KB_MAX_CONCURRENCY must be between 1 and 2")
+        return v
+
+    @field_validator("member_kb_retries")
+    @classmethod
+    def _validate_member_kb_retries(cls, v: int) -> int:
+        if not 1 <= v <= 3:
+            raise ValueError("WO_MEMBER_KB_RETRIES must be between 1 and 3")
+        return v
 
     @field_validator("agent_continuation_max_followups")
     @classmethod
@@ -228,6 +396,8 @@ class Settings(BaseSettings):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.raw_wechat_enabled:
+            self.raw_wechat_workspace.mkdir(parents=True, exist_ok=True)
 
 
 

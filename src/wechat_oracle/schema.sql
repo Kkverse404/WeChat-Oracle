@@ -1,4 +1,4 @@
--- WeChat-Oracle SQLite schema (v1)
+-- WeChat-Oracle SQLite schema (v3)
 -- Single source of truth for normalized chat messages.
 -- Status field drives the downstream pipeline (mm -> segmenter -> indexer).
 
@@ -28,6 +28,49 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_t       ON messages (group_id, t);
 CREATE INDEX IF NOT EXISTS idx_messages_status        ON messages (status);
 CREATE INDEX IF NOT EXISTS idx_messages_sender        ON messages (sender_wxid);
 CREATE INDEX IF NOT EXISTS idx_messages_wx_msg_id     ON messages (wx_msg_id);
+-- Member-knowledge reads always scope by group + normalized sender and then
+-- walk the immutable message id cursor.  Keep the raw sender value unchanged;
+-- NULL/blank values are normalized to __unknown__ by the knowledge layer.
+CREATE INDEX IF NOT EXISTS idx_messages_group_sender_msg
+    ON messages (group_id, sender_wxid, msg_id);
+
+-- Maps display-name-derived UI ids onto a verified real @chatroom id. This
+-- keeps raw history, UI live events, dispatcher context, and daily summaries
+-- in one canonical group without exposing account metadata.
+CREATE TABLE IF NOT EXISTS group_aliases (
+    alias_id            TEXT PRIMARY KEY,
+    canonical_group_id  TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    updated_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_group_aliases_canonical
+    ON group_aliases(canonical_group_id);
+
+-- Explicit local-WeChat read authorization. The display name is informational;
+-- the security boundary is the anonymous account fingerprint + real chatroom id.
+CREATE TABLE IF NOT EXISTS raw_group_authorizations (
+    account_fingerprint TEXT NOT NULL,
+    canonical_group_id  TEXT NOT NULL,
+    display_name        TEXT NOT NULL,
+    contact_generation TEXT NOT NULL,
+    enabled             INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    PRIMARY KEY(account_fingerprint, canonical_group_id)
+);
+
+CREATE TABLE IF NOT EXISTS raw_import_cursors (
+    account_fingerprint TEXT NOT NULL,
+    canonical_group_id  TEXT NOT NULL,
+    shard_id             TEXT NOT NULL,
+    database_generation TEXT NOT NULL,
+    last_local_id        INTEGER NOT NULL DEFAULT 0,
+    updated_at           REAL NOT NULL,
+    PRIMARY KEY(account_fingerprint, canonical_group_id, shard_id),
+    FOREIGN KEY(account_fingerprint, canonical_group_id)
+        REFERENCES raw_group_authorizations(account_fingerprint, canonical_group_id)
+        ON DELETE CASCADE
+);
 
 -- Lightweight per-group state: cursor for incremental backfill, last-seen for live polling.
 CREATE TABLE IF NOT EXISTS group_state (
@@ -69,6 +112,55 @@ CREATE TABLE IF NOT EXISTS command_runs (
     status      TEXT NOT NULL CHECK (status IN ('running', 'ok', 'error')),
     result      TEXT
 );
+
+-- Durable bridge from the authorized raw database watcher to the interactive
+-- dispatcher. Only fresh inbound exact @mentions are inserted here. Keeping
+-- this separate from messages.source preserves archive provenance while the
+-- expiry prevents delayed replies to historical imports.
+CREATE TABLE IF NOT EXISTS raw_reply_candidates (
+    msg_id          INTEGER PRIMARY KEY REFERENCES messages(msg_id) ON DELETE CASCADE,
+    discovered_at   REAL NOT NULL,
+    expires_at      REAL NOT NULL,
+    reason          TEXT NOT NULL CHECK(reason IN ('exact_mention'))
+);
+CREATE INDEX IF NOT EXISTS idx_raw_reply_candidates_expiry
+    ON raw_reply_candidates(expires_at);
+
+-- Idempotent automatic summaries and their delivery state. `unknown` means
+-- the UI send may have happened; it is deliberately never auto-retried.
+CREATE TABLE IF NOT EXISTS summary_runs (
+    run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        TEXT NOT NULL,
+    group_name      TEXT,
+    period_start    INTEGER NOT NULL,
+    period_end      INTEGER NOT NULL,
+    trigger_kind    TEXT NOT NULL CHECK(trigger_kind IN ('hourly', 'daily', 'manual')),
+    status          TEXT NOT NULL CHECK(status IN ('running', 'skipped', 'ready', 'sent', 'failed', 'unknown')),
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    summary_text    TEXT,
+    result          TEXT NOT NULL DEFAULT '',
+    started_at      REAL NOT NULL,
+    finished_at     REAL,
+    generation_attempt_count INTEGER NOT NULL DEFAULT 1,
+    lease_token     TEXT,
+    lease_until     REAL,
+    updated_at      REAL NOT NULL DEFAULT 0,
+    UNIQUE(group_id, period_start, period_end, trigger_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_summary_runs_period
+    ON summary_runs(period_end, status);
+
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+    delivery_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary_run_id  INTEGER NOT NULL UNIQUE REFERENCES summary_runs(run_id) ON DELETE CASCADE,
+    status          TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'unknown')),
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_status
+    ON delivery_outbox(status, updated_at);
 
 -- ---------- Agent loop + memory (CLAUDE.md F17, see plan in commit history) ----------
 -- The dispatcher's @<bot> chat path runs through a multi-turn tool-calling agent
@@ -182,9 +274,140 @@ CREATE TABLE IF NOT EXISTS group_notes (
     updated_at   REAL
 );
 
+-- ---------- Per-group member knowledge -----------------------------------
+-- These tables are additive derived state.  messages remains the only raw
+-- message store and is never copied into a member-specific table.
+CREATE TABLE IF NOT EXISTS member_profiles (
+    group_id             TEXT NOT NULL,
+    sender_wxid          TEXT NOT NULL,
+    display_name         TEXT,
+    profile_json         TEXT NOT NULL DEFAULT '{}',
+    summary_text         TEXT NOT NULL DEFAULT '',
+    locked_sections_json TEXT NOT NULL DEFAULT '[]',
+    version              INTEGER NOT NULL DEFAULT 1,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    deleted_at           REAL,
+    PRIMARY KEY (group_id, sender_wxid)
+);
+CREATE INDEX IF NOT EXISTS idx_member_profiles_group
+    ON member_profiles(group_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS member_alias_history (
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    alias         TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at  REAL NOT NULL,
+    seen_count    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (group_id, sender_wxid, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_member_alias_history_lookup
+    ON member_alias_history(group_id, alias);
+
+CREATE TABLE IF NOT EXISTS member_claims (
+    claim_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    section       TEXT NOT NULL CHECK(section IN (
+        'identity','interests','skills','communication_style','habits',
+        'relationships','opinions','sensitive_inferences','recent_focus'
+    )),
+    claim_text    TEXT NOT NULL,
+    basis         TEXT NOT NULL CHECK(basis IN ('self_reported','observed','inferred')),
+    confidence    REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+    sensitive     INTEGER NOT NULL DEFAULT 0 CHECK(sensitive IN (0,1)),
+    status        TEXT NOT NULL DEFAULT 'current'
+                  CHECK(status IN ('current','superseded','deleted')),
+    superseded_by INTEGER,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (group_id, sender_wxid)
+        REFERENCES member_profiles(group_id, sender_wxid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_claims_member_status
+    ON member_claims(group_id, sender_wxid, status, section);
+
+CREATE TABLE IF NOT EXISTS member_claim_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id   INTEGER NOT NULL,
+    group_id   TEXT NOT NULL,
+    sender_wxid TEXT NOT NULL,
+    msg_id     INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (claim_id, msg_id),
+    FOREIGN KEY (claim_id) REFERENCES member_claims(claim_id) ON DELETE CASCADE,
+    FOREIGN KEY (msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_claim_evidence_msg
+    ON member_claim_evidence(group_id, sender_wxid, msg_id);
+
+CREATE TABLE IF NOT EXISTS member_update_state (
+    group_id              TEXT NOT NULL,
+    sender_wxid           TEXT NOT NULL,
+    cursor_msg_id         INTEGER NOT NULL DEFAULT 0,
+    cursor_t              INTEGER,
+    full_history_complete INTEGER NOT NULL DEFAULT 0 CHECK(full_history_complete IN (0,1)),
+    last_status           TEXT NOT NULL DEFAULT 'idle',
+    last_error            TEXT,
+    last_run_id           INTEGER,
+    updated_at            REAL NOT NULL,
+    PRIMARY KEY (group_id, sender_wxid),
+    FOREIGN KEY (group_id, sender_wxid)
+        REFERENCES member_profiles(group_id, sender_wxid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_member_update_state_due
+    ON member_update_state(group_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS member_update_runs (
+    run_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id      TEXT NOT NULL,
+    sender_wxid   TEXT NOT NULL,
+    mode          TEXT NOT NULL CHECK(mode IN ('full','incremental','manual')),
+    status        TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
+    cursor_before INTEGER,
+    cursor_after  INTEGER,
+    chunk_count   INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_text    TEXT,
+    started_at    REAL NOT NULL,
+    finished_at   REAL,
+    details_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_member_update_runs_member
+    ON member_update_runs(group_id, sender_wxid, started_at);
+
+CREATE TABLE IF NOT EXISTS member_profile_broadcasts (
+    campaign_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','complete','partial','cancelled')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_member_profile_broadcasts_status
+    ON member_profile_broadcasts(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS member_profile_broadcast_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL REFERENCES member_profile_broadcasts(campaign_id) ON DELETE CASCADE,
+    sender_wxid TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')),
+    delivery_marker INTEGER NOT NULL UNIQUE,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    UNIQUE(campaign_id, sender_wxid)
+);
+CREATE INDEX IF NOT EXISTS idx_member_profile_broadcast_items_due
+    ON member_profile_broadcast_items(campaign_id, status, item_id);
+
 -- Schema version, for future migrations. Bumped manually when DDL changes.
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '1');
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '5');
+UPDATE schema_meta SET value = '5' WHERE key = 'version';

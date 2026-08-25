@@ -18,9 +18,9 @@ Adding a subcommand: also update README quickstart + process table
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -31,6 +31,7 @@ import typer
 from loguru import logger
 
 from .config import settings
+from .supervisor import ProcessSupervisor, build_commands
 from .db import get_conn, init_db, transaction
 from .ingest.backfill import import_file
 from .ingest.writer import write_messages
@@ -42,12 +43,609 @@ worker_app = typer.Typer(no_args_is_help=True, help="Background workers that fil
 verify_app = typer.Typer(no_args_is_help=True, help="Health checks for the dispatch pipeline.")
 agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memory (persona_drift / group_memory / run logs).")
 openclaw_app = typer.Typer(no_args_is_help=True, help="OpenClaw runtime backend (the recommended agent path; uses subscription instead of per-token API).")
+raw_app = typer.Typer(no_args_is_help=True, help="Authorized read-only local WeChat database synchronization.")
+member_kb_app = typer.Typer(no_args_is_help=True, help="Inspect and maintain evidence-linked per-member knowledge.")
+summary_app = typer.Typer(no_args_is_help=True, help="Preview and send audited one-shot group summaries.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(worker_app, name="worker")
 app.add_typer(verify_app, name="verify")
 app.add_typer(agent_app, name="agent")
 app.add_typer(openclaw_app, name="openclaw")
+app.add_typer(raw_app, name="raw")
+app.add_typer(member_kb_app, name="member-kb")
+app.add_typer(summary_app, name="summary")
+
+
+def _resolve_summary_send_group(conn, selector: str) -> tuple[str, str]:
+    from .daily_summary import resolve_summary_groups
+
+    selector = selector.strip()
+    matches = [
+        item for item in resolve_summary_groups(conn)
+        if selector in {item[0], item[1]}
+    ]
+    if not matches:
+        raise typer.BadParameter(
+            "group must exactly match a currently selected and send-authorized group id or name"
+        )
+    if len(matches) != 1:
+        raise typer.BadParameter("group selector is ambiguous; use the exact canonical group id")
+    return matches[0]
+
+
+def _explicit_summary_period(start_text: str, end_text: str) -> "SummaryPeriod":
+    """Parse an action-time confirmed ISO range in the configured timezone."""
+    from .time_ranges import SummaryPeriod
+
+    if not start_text.strip() or not end_text.strip():
+        raise ValueError("--start and --end must be provided together")
+
+    def parse(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.strip())
+        except ValueError as exc:
+            raise ValueError("--start/--end must be ISO date-times") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=settings.summary_tz)
+        else:
+            parsed = parsed.astimezone(settings.summary_tz)
+        return parsed
+
+    start = parse(start_text)
+    end = parse(end_text)
+    start_t, end_t = int(start.timestamp()), int(end.timestamp())
+    if end_t <= start_t:
+        raise ValueError("--end must be later than --start")
+    if end_t > int(time.time()):
+        raise ValueError("--end must not be in the future")
+    kind = "hourly" if end_t - start_t == 3600 and start.minute == end.minute == 0 else "manual"
+    return SummaryPeriod(
+        kind,
+        start_t,
+        end_t,
+        f"{start:%Y-%m-%d %H:%M%z} - {end:%Y-%m-%d %H:%M%z}",
+    )
+
+
+@summary_app.command("send-once")
+def summary_send_once(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    period_kind: str = typer.Option(
+        "previous-hour",
+        "--period",
+        help="previous-hour, latest-active-hour, or previous-day",
+    ),
+    start: str = typer.Option("", "--start", help="Explicit ISO start in summary timezone"),
+    end: str = typer.Option("", "--end", help="Explicit ISO end (exclusive)"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat summary delivery"),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Explicitly retry a failed/skipped generation that has no delivery record",
+    ),
+) -> None:
+    """Generate and send one idempotent summary through the configured UI sender."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    from .daily_summary import (
+        latest_active_hour,
+        reset_failed_summary_period,
+        resolve_summary_groups,
+        run_summary_group,
+    )
+    from .llm import build_llm_client
+    from .replier import build_replier
+    from .time_ranges import SummaryPeriod, latest_mature_summary_periods
+
+    normalized = period_kind.strip().lower()
+    if normalized not in {"previous-hour", "latest-active-hour", "previous-day"}:
+        raise typer.BadParameter(
+            "--period must be previous-hour, latest-active-hour, or previous-day"
+        )
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        if bool(start.strip()) != bool(end.strip()):
+            raise typer.BadParameter("--start and --end must be provided together")
+        if start.strip() and end.strip():
+            try:
+                period = _explicit_summary_period(start, end)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            min_messages = settings.hourly_summary_min_messages
+        elif normalized == "latest-active-hour":
+            period = latest_active_hour(
+                conn,
+                group_id=group_id,
+                min_messages=settings.hourly_summary_min_messages,
+            )
+            if period is None:
+                raise typer.BadParameter("no completed active hour has enough messages")
+            min_messages = settings.hourly_summary_min_messages
+        else:
+            periods = latest_mature_summary_periods(
+                tz=settings.summary_tz,
+                grace_seconds=settings.summary_sync_grace_seconds,
+                hourly=normalized == "previous-hour",
+                daily=normalized == "previous-day",
+            )
+            period = periods[0]
+            min_messages = (
+                settings.hourly_summary_min_messages
+                if period.kind == "hourly"
+                else settings.daily_summary_min_messages
+            )
+        if retry_failed:
+            reset_failed_summary_period(conn, group_id=group_id, period=period)
+        llm = build_llm_client(
+            provider=settings.llm_provider,
+            api_key=settings.llm_api_key,
+            endpoint=settings.llm_endpoint,
+            json_mode=settings.llm_json_mode,
+        )
+        replier = build_replier(force_send=True)
+        result = run_summary_group(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            period=period,
+            min_messages=min_messages,
+            replier=replier,
+            llm=llm,
+            require_current_authorization=True,
+        )
+        row = conn.execute(
+            """
+            SELECT run_id,status,message_count,LENGTH(summary_text) AS summary_chars,result
+              FROM summary_runs
+             WHERE group_id=? AND period_start=? AND period_end=? AND trigger_kind=?
+            """,
+            (group_id, period.start_t, period.end_t, period.kind),
+        ).fetchone()
+    payload = {
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "period": period.label,
+        "run": dict(row) if row is not None else None,
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
+
+
+@member_kb_app.command("send")
+def member_kb_send(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    member: str = typer.Argument(..., help="Exact member id, stored name, or known alias"),
+    display_name: str = typer.Option("", "--display-name", help="Verified current group nickname for the card title"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat profile-card delivery"),
+) -> None:
+    """Send one specified completed, evidence-linked member profile card."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    title = display_name.strip()
+    if title and (len(title) > 80 or "\n" in title or "\r" in title):
+        raise typer.BadParameter("display name must be a single line of at most 80 characters")
+    from .daily_summary import deliver_manual_text
+    from .member_knowledge import get_member_profile, render_member_profile_card
+    from .replier import build_replier
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        state = conn.execute(
+            "SELECT full_history_complete FROM member_update_state WHERE group_id=? AND sender_wxid=?",
+            (group_id, sender_wxid),
+        ).fetchone()
+        profile = get_member_profile(conn, group_id, sender_wxid)
+        if (
+            profile is None
+            or state is None
+            or not bool(state["full_history_complete"])
+            or not (str(profile.get("summary_text") or "").strip() or profile.get("claims"))
+        ):
+            raise typer.BadParameter("the selected member has no completed publishable profile")
+        if title:
+            profile = dict(profile)
+            profile["display_name"] = title
+        card = render_member_profile_card(profile)
+        result = deliver_manual_text(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            text=card,
+            replier=build_replier(force_send=True),
+            require_current_authorization=True,
+        )
+    typer.echo(json.dumps({
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "member": profile.get("display_name") or profile.get("sender_wxid"),
+        "profile_version": profile.get("version"),
+    }, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
+
+
+def _run_raw_command(command: str, *args: str) -> None:
+    from .raw_wechat.cli import main as raw_main
+
+    code = raw_main([command, *args])
+    if code:
+        raise typer.Exit(code)
+
+
+@raw_app.command("scan")
+def raw_scan() -> None:
+    """Discover anonymous local WeChat accounts and numeric message shards."""
+    _run_raw_command("scan")
+
+
+@raw_app.command("groups")
+def raw_groups(
+    account: str = typer.Option("", "--account", help="Anonymous account fingerprint"),
+) -> None:
+    """Decrypt the current contact snapshot and list selectable chatrooms."""
+    _run_raw_command("groups", *(["--account", account] if account else []))
+
+
+@raw_app.command("authorize")
+def raw_authorize(
+    canonical_id: str = typer.Argument(..., help="Exact @chatroom id returned by raw groups"),
+    account: str = typer.Option("", "--account", help="Anonymous account fingerprint"),
+) -> None:
+    """Authorize one exact canonical group for local archive reads."""
+    args = ["--canonical-id", canonical_id]
+    if account:
+        args.extend(["--account", account])
+    _run_raw_command("authorize", *args)
+
+
+@raw_app.command("revoke")
+def raw_revoke(
+    canonical_id: str = typer.Argument(...),
+    account: str = typer.Option("", "--account"),
+) -> None:
+    """Disable future reads for one previously authorized group."""
+    args = ["--canonical-id", canonical_id]
+    if account:
+        args.extend(["--account", account])
+    _run_raw_command("revoke", *args)
+
+
+@raw_app.command("sync")
+def raw_sync(account: str = typer.Option("", "--account")) -> None:
+    """Run one incremental synchronization for all authorized groups."""
+    _run_raw_command("sync", *(["--account", account] if account else []))
+
+
+@raw_app.command("run")
+def raw_run(account: str = typer.Option("", "--account")) -> None:
+    """Continuously synchronize all authorized groups."""
+    _run_raw_command("run", *(["--account", account] if account else []))
+
+
+@raw_app.command("status")
+def raw_status() -> None:
+    """Show sanitized local WeChat authorization and process status."""
+    _run_raw_command("status")
+
+
+def _member_kb_llm():
+    from .llm import build_llm_client
+
+    return build_llm_client(
+        provider=settings.llm_provider,
+        api_key=settings.llm_api_key,
+        endpoint=settings.llm_endpoint,
+        json_mode=settings.llm_json_mode,
+    )
+
+
+def _resolve_member_selector(conn, group_id: str, selector: str) -> str:
+    from .member_knowledge import list_member_profiles
+
+    exact: list[str] = []
+    # Exact stable ids remain resolvable even after the derived profile was
+    # deleted, so `rebuild --member <wxid>` can revive it from raw history.
+    raw = conn.execute(
+        """
+        SELECT DISTINCT CASE
+            WHEN sender_wxid IS NULL OR TRIM(sender_wxid)='' THEN '__unknown__'
+            ELSE TRIM(sender_wxid) END AS member
+          FROM messages
+         WHERE group_id=?
+        """,
+        (group_id,),
+    ).fetchall()
+    exact.extend(str(row["member"]) for row in raw if selector == str(row["member"]))
+    for item in list_member_profiles(conn, group_id):
+        sender = str(item.get("sender_wxid") or "")
+        names = {
+            str(item.get("display_name") or ""),
+            str(item.get("current_display_name") or ""),
+            *(str(value) for value in (item.get("aliases") or [])),
+        }
+        if selector == sender or selector in names:
+            exact.append(sender)
+    exact = list(dict.fromkeys(value for value in exact if value))
+    if not exact:
+        raise typer.BadParameter("member selector did not match an exact member id or name")
+    if len(exact) != 1:
+        raise typer.BadParameter("member selector is ambiguous; use the exact sender wxid")
+    return exact[0]
+
+
+def _member_kb_selected_group_ids(conn) -> list[str]:
+    selectors = [str(item) for item in settings.groups if str(item).strip()]
+    if not selectors:
+        return []
+    placeholders = ",".join("?" for _ in selectors)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT COALESCE(ga.canonical_group_id, m.group_id) AS group_id
+          FROM messages m
+          LEFT JOIN group_aliases ga ON ga.alias_id=m.group_id
+         WHERE m.group_id IN ({placeholders})
+            OR m.group_name IN ({placeholders})
+            OR EXISTS (
+                SELECT 1 FROM raw_group_authorizations rga
+                 WHERE rga.canonical_group_id=COALESCE(ga.canonical_group_id,m.group_id)
+                   AND (rga.canonical_group_id IN ({placeholders})
+                        OR rga.display_name IN ({placeholders}))
+            )
+        """,
+        selectors * 4,
+    ).fetchall()
+    group_ids = [str(row["group_id"]) for row in rows]
+    if settings.raw_wechat_enabled:
+        authorized = {
+            str(row["canonical_group_id"])
+            for row in conn.execute(
+                """
+                SELECT canonical_group_id FROM raw_group_authorizations
+                 WHERE account_fingerprint=? AND enabled=1
+                """,
+                (settings.raw_wechat_account,),
+            ).fetchall()
+        }
+        group_ids = [group for group in group_ids if group in authorized]
+    return sorted(set(group_ids))
+
+
+def _require_member_kb_selected_group(conn, group_id: str) -> None:
+    if group_id not in _member_kb_selected_group_ids(conn):
+        raise typer.BadParameter(
+            "--group-id is not in the current exact member-knowledge authorization"
+        )
+
+
+@member_kb_app.command("status")
+def member_kb_status(group_id: str = typer.Option("", "--group-id")) -> None:
+    """Show derived-profile progress without printing chat content."""
+    init_db()
+    with get_conn() as conn:
+        if group_id:
+            _require_member_kb_selected_group(conn, group_id)
+        where = "WHERE p.group_id=?" if group_id else ""
+        params = (group_id,) if group_id else ()
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS profiles,
+                   COALESCE(SUM(CASE WHEN s.cursor_msg_id > 0 THEN 1 ELSE 0 END), 0) AS initialized,
+                   COALESCE(MAX(p.updated_at), 0) AS last_updated
+              FROM member_profiles p
+              LEFT JOIN member_update_state s
+                ON s.group_id=p.group_id AND s.sender_wxid=p.sender_wxid
+              {where}
+            """,
+            params,
+        ).fetchone()
+    typer.echo(json.dumps(dict(row), ensure_ascii=False))
+
+
+def _run_member_kb_once(*, group_id: str, member: str) -> dict:
+    from .member_knowledge import run_due_member_updates, run_member_update
+
+    init_db()
+    with get_conn() as conn:
+        selected_groups = _member_kb_selected_group_ids(conn)
+        if group_id:
+            _require_member_kb_selected_group(conn, group_id)
+        if not group_id and not selected_groups:
+            raise typer.BadParameter(
+                "no exact groups are selected; configure a group or pass an authorized --group-id"
+            )
+        llm = _member_kb_llm()
+        if member:
+            if not group_id:
+                raise typer.BadParameter("--group-id is required with --member")
+            sender_wxid = _resolve_member_selector(conn, group_id, member)
+            return run_member_update(
+                conn,
+                group_id,
+                sender_wxid,
+                llm,
+                chunk_chars=settings.member_kb_chunk_chars,
+                retries=settings.member_kb_retries,
+            )
+        return run_due_member_updates(
+            conn,
+            llm,
+            group_ids=[group_id] if group_id else selected_groups,
+            chunk_chars=settings.member_kb_chunk_chars,
+            retries=settings.member_kb_retries,
+        )
+
+
+@member_kb_app.command("bootstrap")
+def member_kb_bootstrap(
+    group_id: str = typer.Option("", "--group-id"),
+    member: str = typer.Option("", "--member"),
+) -> None:
+    """Resume full-history profile construction from durable member cursors."""
+    typer.echo(json.dumps(_run_member_kb_once(group_id=group_id, member=member), ensure_ascii=False))
+
+
+@member_kb_app.command("run-once")
+def member_kb_run_once(
+    group_id: str = typer.Option("", "--group-id"),
+    member: str = typer.Option("", "--member"),
+) -> None:
+    """Process currently pending member messages once."""
+    typer.echo(json.dumps(_run_member_kb_once(group_id=group_id, member=member), ensure_ascii=False))
+
+
+@member_kb_app.command("show")
+def member_kb_show(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    messages: bool = typer.Option(False, "--messages", help="Include original messages explicitly"),
+    limit: int = typer.Option(50, "--limit", min=1, max=500),
+) -> None:
+    """Show one profile; raw messages require the explicit --messages flag."""
+    from .member_knowledge import get_member_profile, list_member_messages
+
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        payload = get_member_profile(conn, group_id, sender_wxid) or {}
+        if messages:
+            payload = dict(payload)
+            payload["messages"] = list_member_messages(
+                conn, group_id, sender_wxid, limit=limit
+            )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+@member_kb_app.command("send-random")
+def member_kb_send_random(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat profile-card delivery"),
+) -> None:
+    """Randomly send one completed, evidence-linked member profile card."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    from .daily_summary import deliver_manual_text
+    from .member_knowledge import render_member_profile_card, select_random_completed_profile
+    from .replier import build_replier
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        profile = select_random_completed_profile(conn, group_id)
+        if profile is None:
+            raise typer.BadParameter("no completed publishable member profile is available")
+        card = render_member_profile_card(profile)
+        replier = build_replier(force_send=True)
+        result = deliver_manual_text(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            text=card,
+            replier=replier,
+            require_current_authorization=True,
+        )
+    typer.echo(json.dumps({
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "member": profile.get("display_name") or profile.get("sender_wxid"),
+        "profile_version": profile.get("version"),
+    }, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
+
+
+@member_kb_app.command("delete")
+def member_kb_delete(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm derived-profile deletion"),
+) -> None:
+    """Delete derived member knowledge while retaining every raw message."""
+    from .member_knowledge import delete_member_profile
+
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm; raw messages will be retained")
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        delete_member_profile(conn, group_id, sender_wxid, keep_messages=True)
+    typer.echo("derived profile deleted; raw messages retained")
+
+
+@member_kb_app.command("broadcast-all")
+def member_kb_broadcast_all(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    skip_member: list[str] = typer.Option([], "--skip-member", help="Exact member id already delivered; repeatable"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the persistent all-member delivery campaign"),
+) -> None:
+    """Queue a restart-safe campaign; the running product builds and sends automatically."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm multiple real WeChat deliveries")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    from .member_broadcast import create_or_resume_broadcast
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        status = create_or_resume_broadcast(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            skip_members=skip_member,
+        )
+    typer.echo(json.dumps(status, ensure_ascii=False))
+
+
+@member_kb_app.command("broadcast-status")
+def member_kb_broadcast_status() -> None:
+    """Show sanitized progress for the latest all-member delivery campaign."""
+    from .member_broadcast import broadcast_status
+
+    init_db()
+    with get_conn() as conn:
+        status = broadcast_status(conn)
+    typer.echo(json.dumps(status, ensure_ascii=False))
+
+
+@member_kb_app.command("rebuild")
+def member_kb_rebuild(
+    group_id: str = typer.Option(..., "--group-id"),
+    member: str = typer.Option(..., "--member"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm full-history rebuild"),
+) -> None:
+    """Reset one derived profile and rebuild it from its complete message history."""
+    from .member_knowledge import reset_member_profile, run_member_update
+
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm the full-history rebuild")
+    init_db()
+    with get_conn() as conn:
+        _require_member_kb_selected_group(conn, group_id)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        reset_member_profile(conn, group_id, sender_wxid)
+        result = run_member_update(
+            conn,
+            group_id,
+            sender_wxid,
+            _member_kb_llm(),
+            chunk_chars=settings.member_kb_chunk_chars,
+            retries=settings.member_kb_retries,
+        )
+    typer.echo(json.dumps(result, ensure_ascii=False))
 
 
 def _configure_stdio_utf8() -> None:
@@ -66,6 +664,17 @@ def _configure_stdio_utf8() -> None:
                 reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+
+def _self_command(*args: str) -> list[str]:
+    """Launch this CLI from source or from the frozen Windows executable."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    return ["uv", "run", "wechat-oracle", *args]
+
+
+def _self_command_text(*args: str) -> str:
+    return subprocess.list2cmdline(_self_command(*args))
 
 
 def _env_bool(value: bool) -> str:
@@ -106,88 +715,104 @@ def setup(
     typer.echo("WeChat Oracle setup")
     typer.echo("Press Enter to accept defaults. Secrets are written only to .env.")
     typer.echo("")
-    typer.echo("WeFlow is required and is not installed by this command.")
-    typer.echo(_weflow_setup_hint())
+    typer.echo("Core runtime: local SQLite memory + OpenAI-compatible API.")
+    typer.echo("Local WeChat database access is optional and read-only.")
     typer.echo("")
 
-    weflow_token = typer.prompt("WeFlow token", default=settings.weflow_token or "", hide_input=True)
-    groups = typer.prompt(
-        "Groups to monitor (empty = all group chats exposed by WeFlow)",
+    use_local_db = typer.confirm(
+        "Read and continuously monitor the local WeChat chat database?",
+        default=settings.raw_wechat_enabled,
+    )
+    ingest_backend = "wx4py" if use_local_db else typer.prompt(
+        "Ingest backend (weflow/wx4py)", default=settings.ingest_backend
+    ).strip().lower()
+    if ingest_backend not in {"weflow", "wx4py"}:
+        typer.echo("Ingest backend must be 'weflow' or 'wx4py'.")
+        raise typer.Exit(1)
+    weflow_token = (
+        typer.prompt("WeFlow token", default=settings.weflow_token or "", hide_input=True)
+        if ingest_backend == "weflow" else ""
+    )
+    groups = "" if use_local_db else typer.prompt(
+        "Groups to monitor (comma-separated)",
         default=",".join(settings.groups),
         show_default=False,
     )
     bot_name = typer.prompt("Bot group nickname (WO_BOT_NAME)", default=settings.bot_name or "")
     reply_backend = typer.prompt(
-        "Reply backend (wx4py/stdout)",
+        "Reply backend (uia-direct/wx4py/stdout)",
         default=settings.reply_backend or "wx4py",
     ).strip().lower()
-    if reply_backend not in {"wx4py", "stdout"}:
-        typer.echo("Reply backend must be 'wx4py' or 'stdout'.")
+    if reply_backend not in {"uia-direct", "wx4py", "stdout"}:
+        typer.echo("Reply backend must be 'uia-direct', 'wx4py', or 'stdout'.")
         raise typer.Exit(1)
     reply = reply_backend != "stdout"
 
-    backend = typer.prompt(
-        "Agent backend (native/openclaw)",
-        default=settings.agent_backend or "native",
-    ).strip().lower()
-    if backend not in {"native", "openclaw"}:
-        typer.echo("Agent backend must be 'native' or 'openclaw'.")
-        raise typer.Exit(1)
+    backend = "native"
+    hourly_summary = typer.confirm("Send a summary after each completed hour?", default=False)
+    daily_summary = typer.confirm("Send the previous-day summary after midnight?", default=False)
     values: dict[str, str] = {
         "WO_WEFLOW_BASE_URL": settings.weflow_base_url,
         "WO_WEFLOW_TOKEN": weflow_token,
+        "WO_INGEST_BACKEND": ingest_backend,
         "WO_GROUPS": groups,
         "WO_BOT_NAME": bot_name,
         "WO_REPLY": _env_bool(reply),
         "WO_REPLY_BACKEND": reply_backend,
         "WO_REPLY_MENTION_POLICY": settings.reply_mention_policy,
+        "WO_REPLY_ALLOWED_GROUPS": groups,
+        "WO_REPLY_FAIL_CLOSED": _env_bool(settings.reply_fail_closed),
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": str(settings.agent_base_probability),
         "WO_AGENT_PROACTIVE_MODE": settings.agent_proactive_mode,
+        "WO_AGENT_MAX_STEPS": str(settings.agent_max_steps),
+        "WO_AGENT_REFLECTION_ENABLED": _env_bool(settings.agent_reflection_enabled),
         "WO_AGENT_RECENT_CONTEXT_CHAT": str(settings.agent_recent_context_chat),
+        "WO_AGENT_MEMORY_MAX_CHARS": str(settings.agent_memory_max_chars),
+        "WO_AGENT_MAX_TOOL_CALLS_PER_RUN": str(settings.agent_max_tool_calls_per_run),
         "WO_LLM_MAX_TOKENS": str(settings.llm_max_tokens),
         "WO_LLM_WRITE_MAX_TOKENS": str(settings.llm_write_max_tokens or ""),
         "WO_AGENT_LURK_ENABLED": _env_bool(settings.agent_lurk_enabled),
         "WO_AGENT_LURK_INTERVAL_SECONDS": str(settings.agent_lurk_interval_seconds),
         "WO_AGENT_LURK_MIN_NEW_MESSAGES": str(settings.agent_lurk_min_new_messages),
+        "WO_RAW_WECHAT_ENABLED": _env_bool(use_local_db),
+        "WO_RAW_WECHAT_ACCOUNT": "",
+        "WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS": str(settings.raw_wechat_sync_interval_seconds),
+        "WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED": _env_bool(
+            settings.raw_wechat_reply_fallback_enabled
+        ),
+        "WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS": str(
+            settings.raw_wechat_reply_fallback_max_age_seconds
+        ),
+        "WO_HOURLY_SUMMARY_ENABLED": _env_bool(hourly_summary),
+        "WO_DAILY_SUMMARY_ENABLED": _env_bool(daily_summary),
+        "WO_SUMMARY_SYNC_GRACE_SECONDS": str(settings.summary_sync_grace_seconds),
+        # Member profiling stays off during first-run setup. Enable it later
+        # from the dashboard, where archived-message counts and the privacy
+        # warning can be shown before consent is persisted.
+        "WO_MEMBER_KB_ENABLED": "False",
+        "WO_MEMBER_KB_INTERVAL_SECONDS": str(settings.member_kb_interval_seconds),
+        "WO_MEMBER_KB_CHUNK_CHARS": str(settings.member_kb_chunk_chars),
+        "WO_MEMBER_KB_MAX_CONCURRENCY": str(settings.member_kb_max_concurrency),
+        "WO_MEMBER_KB_RETRIES": str(settings.member_kb_retries),
     }
 
-    if backend == "openclaw":
-        values.update(
-            {
-                "WO_OPENCLAW_GATEWAY_URL": typer.prompt(
-                    "OpenClaw gateway URL",
-                    default=settings.openclaw_gateway_url,
-                ),
-                "WO_OPENCLAW_TOKEN": typer.prompt(
-                    "OpenClaw gateway token",
-                    default=settings.openclaw_token or "",
-                    hide_input=True,
-                ),
-                "WO_OPENCLAW_AGENT_ID": typer.prompt(
-                    "OpenClaw agent id",
-                    default=settings.openclaw_agent_id,
-                ),
-                "WO_OPENCLAW_TIMEOUT_SECONDS": str(settings.openclaw_timeout_seconds),
-            }
-        )
-    else:
-        values.update(
-            {
-                "WO_LLM_PROVIDER": settings.llm_provider,
-                "WO_LLM_API_KEY": typer.prompt(
-                    "LLM API key",
-                    default=settings.llm_api_key or "",
-                    hide_input=True,
-                ),
-                "WO_LLM_ENDPOINT": typer.prompt(
-                    "LLM endpoint",
-                    default=settings.llm_endpoint,
-                ),
-                "WO_LLM_MODEL": typer.prompt("LLM model", default=settings.llm_model),
-                "WO_LLM_JSON_MODE": settings.llm_json_mode,
-            }
-        )
+    values.update(
+        {
+            "WO_LLM_PROVIDER": "openai-compatible",
+            "WO_LLM_API_KEY": typer.prompt(
+                "LLM API key",
+                default=settings.llm_api_key or "",
+                hide_input=True,
+            ),
+            "WO_LLM_ENDPOINT": typer.prompt(
+                "LLM endpoint",
+                default=settings.llm_endpoint,
+            ),
+            "WO_LLM_MODEL": typer.prompt("LLM model", default=settings.llm_model),
+            "WO_LLM_JSON_MODE": settings.llm_json_mode,
+        }
+    )
 
     if typer.confirm("Configure optional vision model for image reading?", default=False):
         values.update(
@@ -212,11 +837,98 @@ def setup(
         )
 
     _write_env(env_path, values, force=force)
+    os.environ.update(values)
+    from .config import reload_settings
+    reload_settings()
     init_db()
+    if use_local_db:
+        _interactive_raw_group_setup(env_path)
     typer.echo(f"\nwrote {env_path}")
     typer.echo("next:")
-    typer.echo("  uv run wechat-oracle doctor")
-    typer.echo("  uv run wechat-oracle run")
+    typer.echo(f"  {_self_command_text('doctor')}")
+    typer.echo(f"  {_self_command_text('run')}")
+
+
+def _interactive_raw_group_setup(env_path: Path) -> None:
+    """Discover one account and let the operator authorize exact chatrooms."""
+    from .config_store import _update_env_file
+    from .raw_wechat.cli import (
+        _account_lock,
+        _account_map,
+        _authorize_group,
+        _cleanup_decrypted,
+        _latest_contact,
+        _resolve_install_root,
+        _select_account,
+        _unlock_contact,
+    )
+    from .raw_wechat.importer import list_groups
+    from .raw_wechat.inventory import discover_message_databases
+    from .raw_wechat.profile_41155 import verify_install
+
+    typer.echo("\nScanning the reviewed WeChat 4 local database layout...")
+    candidates = discover_message_databases()
+    accounts = _account_map(candidates)
+    if not accounts:
+        typer.echo("No supported local WeChat database was found. You can retry later from `raw scan`.")
+        return
+    if len(accounts) == 1:
+        account = next(iter(accounts))
+    else:
+        typer.echo("Detected anonymous accounts:")
+        for index, fingerprint in enumerate(sorted(accounts), 1):
+            typer.echo(f"  {index}. {fingerprint} ({len(accounts[fingerprint])} shards)")
+        selected = typer.prompt("Account number", type=int)
+        ordered = sorted(accounts)
+        if selected < 1 or selected > len(ordered):
+            raise typer.BadParameter("account number is out of range")
+        account = ordered[selected - 1]
+    _, account_candidates = _select_account(candidates, account)
+    verify_install(_resolve_install_root(settings.raw_wechat_install_root))
+    typer.echo("Reading the current contact snapshot; this may take a while on first run...")
+    with _account_lock(settings.raw_wechat_workspace, account):
+        unlocked = _unlock_contact(account_candidates[0], settings.raw_wechat_workspace)
+        if "contact.db" in unlocked["failures"]:
+            raise RuntimeError("the current contact database could not be verified")
+        message_dbs: list[Path] = []
+        contact_db = _latest_contact(settings.raw_wechat_workspace, account)
+        options = list_groups(contact_db)
+    if not options:
+        raise RuntimeError("no joined WeChat groups were found in the current contact snapshot")
+    typer.echo("Selectable groups:")
+    for index, option in enumerate(options, 1):
+        typer.echo(f"  {index}. {option.display_name}  [{option.canonical_group_id}]")
+    raw = typer.prompt("Group numbers to monitor/summarize (comma-separated)")
+    indexes: list[int] = []
+    for part in raw.split(","):
+        value = int(part.strip())
+        if value < 1 or value > len(options):
+            raise typer.BadParameter("group number is out of range")
+        if value not in indexes:
+            indexes.append(value)
+    selected_options = [options[index - 1] for index in indexes]
+    for option in selected_options:
+        _authorize_group(
+            workspace=settings.raw_wechat_workspace,
+            account_fingerprint=account,
+            archive_path=settings.db_path,
+            canonical_group_id=option.canonical_group_id,
+            cleanup=False,
+        )
+    _cleanup_decrypted(message_dbs, contact_db)
+    updates = {
+        "WO_RAW_WECHAT_ACCOUNT": account,
+        "WO_GROUPS": json.dumps(
+            [option.display_name for option in selected_options], ensure_ascii=False
+        ),
+        "WO_REPLY_ALLOWED_GROUPS": json.dumps(
+            [option.display_name for option in selected_options], ensure_ascii=False
+        ),
+    }
+    _update_env_file(env_path, updates)
+    os.environ.update(updates)
+    from .config import reload_settings
+    reload_settings()
 
 
 def _doctor_line(name: str, ok: bool, detail: str) -> bool:
@@ -248,7 +960,16 @@ def doctor() -> None:
         "all group chats" if not settings.groups else ", ".join(settings.groups),
     )
 
-    if not settings.weflow_token:
+    if settings.ingest_backend == "wx4py":
+        try:
+            __import__("wx4py")
+            failures += not _doctor_line(
+                "UI ingest", bool(settings.groups),
+                f"wx4py import ok; groups={settings.groups!r}" if settings.groups else "WO_GROUPS is empty",
+            )
+        except Exception as e:
+            failures += not _doctor_line("UI ingest", False, f"wx4py import failed: {e}")
+    elif not settings.weflow_token:
         failures += not _doctor_line(
             "WeFlow API",
             False,
@@ -303,6 +1024,17 @@ def doctor() -> None:
                 )
             except Exception as e:
                 failures += not _doctor_line("OpenClaw gateway", False, f"{type(e).__name__}: {e}")
+    elif backend == "pi":
+        from .llm import PiRpcLLM
+        client = PiRpcLLM(
+            executable=settings.pi_executable,
+            provider=settings.pi_provider,
+            model=settings.pi_model,
+            thinking=settings.pi_thinking,
+            timeout_seconds=settings.pi_timeout_seconds,
+        )
+        available, detail = client.check_available()
+        failures += not _doctor_line("Pi RPC", available, detail)
     else:
         failures += not _doctor_line(
             "LLM config",
@@ -311,10 +1043,19 @@ def doctor() -> None:
             if settings.llm_api_key else "WO_LLM_API_KEY is empty",
         )
 
-    if settings.reply and settings.reply_backend == "wx4py":
+    if settings.reply and settings.reply_backend in {"wx4py", "uia-direct"}:
+        failures += not _doctor_line(
+            "reply allowlist",
+            bool(settings.reply_allowed_groups),
+            ", ".join(settings.reply_allowed_groups) if settings.reply_allowed_groups else "WO_REPLY_ALLOWED_GROUPS is empty",
+        )
         try:
             __import__("wx4py")
-            failures += not _doctor_line("reply backend", True, "wx4py import ok")
+            failures += not _doctor_line(
+                "reply backend",
+                True,
+                f"{settings.reply_backend}: wx4py import ok",
+            )
         except Exception as e:
             failures += not _doctor_line("reply backend", False, f"wx4py import failed: {e}")
     else:
@@ -339,48 +1080,6 @@ def doctor() -> None:
         typer.echo(f"doctor finished with {failures} failing check(s)")
         raise typer.Exit(1)
     typer.echo("doctor passed")
-
-
-def _child_env_for_dashboard() -> dict[str, str]:
-    env = dict(os.environ)
-    # The parent dashboard decodes child stdout as UTF-8. On Windows, Python
-    # child processes otherwise default to the active ANSI code page (often
-    # cp936/GBK), which corrupts Chinese when read through the pipe.
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    return env
-
-
-def _start_log_reader(
-    name: str,
-    proc: subprocess.Popen[str],
-    log_lines: deque[str],
-    lock: threading.Lock,
-) -> threading.Thread:
-    def read() -> None:
-        assert proc.stdout is not None
-        formatter = _DashboardLogFormatter(name)
-        for line in proc.stdout:
-            text = line.rstrip()
-            if not text:
-                continue
-            with lock:
-                for rendered in formatter.feed(text):
-                    log_lines.append(rendered)
-            if _looks_like_model_call_log(text):
-                try:
-                    from .run_tui import request_balance_refresh
-
-                    request_balance_refresh()
-                except Exception:
-                    pass
-        with lock:
-            for rendered in formatter.flush():
-                log_lines.append(rendered)
-
-    thread = threading.Thread(target=read, name=f"wechat-oracle-{name}-log", daemon=True)
-    thread.start()
-    return thread
 
 
 def _looks_like_model_call_log(text: str) -> bool:
@@ -640,24 +1339,8 @@ def _dashboard_process_label(name: str) -> str:
         "live": "INGEST",
         "dispatcher": "DISPATCH",
         "mm": "MEDIA",
+        "raw-sync": "LOCAL DB",
     }.get(name, name)
-
-
-def _terminate_process_tree(proc: subprocess.Popen[str], *, force: bool = False) -> None:
-    if proc.poll() is not None:
-        return
-    if os.name == "nt":
-        cmd = ["taskkill", "/PID", str(proc.pid), "/T"]
-        # uv/console-script wrappers keep the real Python worker as a child or
-        # grandchild on Windows. Non-forced taskkill often leaves that tree
-        # alive, which makes `run` sit on the shutdown deadline every time.
-        cmd.append("/F")
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-    if force:
-        proc.kill()
-    else:
-        proc.send_signal(signal.SIGTERM)
 
 
 @app.command("run")
@@ -670,92 +1353,60 @@ def run(
     if not skip_init:
         init_db()
     settings.ensure_dirs()
-    procs: dict[str, subprocess.Popen[str]] = {}
-    commands = {
-        "live": ["uv", "run", "wechat-oracle", "ingest", "live"],
-        "dispatcher": ["uv", "run", "wechat-oracle", "dispatcher"],
-    }
-    process_lock = threading.Lock()
-    manual_restarts: set[str] = set()
     log_lines: deque[str] = deque(maxlen=1000)
     log_lock = threading.Lock()
-    readers: list[threading.Thread] = []
+    formatters: dict[str, _DashboardLogFormatter] = {}
+
+    def append_line(line: str) -> None:
+        if line:
+            with log_lock:
+                log_lines.append(line)
+
+    def append_run_line(text: str) -> None:
+        append_line(_dashboard_log_line("run", text))
+
+    def emit_log(name: str, text: str) -> None:
+        if plain:
+            typer.echo(f"{_dashboard_process_label(name)} {text}")
+            return
+        if name == "supervisor":
+            append_run_line(text)
+            return
+        formatter = formatters.get(name)
+        if formatter is None:
+            formatter = _DashboardLogFormatter(name)
+            formatters[name] = formatter
+        for rendered in formatter.feed(text):
+            append_line(rendered)
+        if _looks_like_model_call_log(text):
+            try:
+                from .run_tui import request_balance_refresh
+
+                request_balance_refresh()
+            except Exception:
+                pass
+
+    supervisor = ProcessSupervisor(emit_log=emit_log, capture_output=not plain)
     if plain:
         typer.echo("starting WeChat Oracle:")
-
-    def start_process(name: str) -> subprocess.Popen[str]:
-        cmd = commands[name]
-        env = _child_env_for_dashboard()
-        if plain:
-            typer.echo(f"  {name}: {' '.join(cmd)}")
-            proc = subprocess.Popen(cmd, env=env)
-        else:
-            with log_lock:
-                log_lines.append(
-                    _dashboard_log_line("run", f"starting {_dashboard_process_label(name)}  {' '.join(cmd)}")
-                )
-            proc = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-            readers.append(_start_log_reader(name, proc, log_lines, log_lock))
-        with process_lock:
-            procs[name] = proc
-        return proc
-
-    def restart_process(name: str) -> None:
-        with process_lock:
-            proc = procs.get(name)
-            manual_restarts.add(name)
-        if proc is not None:
-            with log_lock:
-                log_lines.append(_dashboard_log_line("run", f"restarting {_dashboard_process_label(name)}"))
-            _terminate_process_tree(proc)
-            deadline = time.time() + (2.0 if os.name == "nt" else 10.0)
-            while proc.poll() is None and time.time() < deadline:
-                time.sleep(0.1)
-            if proc.poll() is None:
-                _terminate_process_tree(proc, force=True)
-        start_process(name)
-        with process_lock:
-            manual_restarts.discard(name)
-        with log_lock:
-            log_lines.append(_dashboard_log_line("run", f"{_dashboard_process_label(name)} restarted"))
-
-    for name in commands:
-        start_process(name)
-
-    def process_rows() -> list[tuple[str, int | None, int | None]]:
-        with process_lock:
-            return [(name, proc.pid, proc.poll()) for name, proc in procs.items()]
+        for name, command in build_commands().items():
+            typer.echo(f"  {name}: {' '.join(command)}")
 
     stop_requested = False
     try:
+        supervisor.start_all()
         if plain:
             while True:
-                with process_lock:
-                    current_procs = list(procs.items())
-                for name, proc in current_procs:
-                    code = proc.poll()
-                    if code is not None:
-                        typer.echo(
-                            f"{_dashboard_process_label(name)} exited with code {code}; stopping remaining processes"
-                        )
-                        raise KeyboardInterrupt
+                if supervisor.poll_once() is not None:
+                    raise KeyboardInterrupt
                 time.sleep(1.0)
         else:
-            from .run_tui import RunDashboard, status_lines_for_processes
             from .config_store import (
                 AgentRuntimeConfig,
                 load_agent_runtime_config,
                 save_agent_runtime_config,
             )
+            from .run_tui import RunDashboard, status_lines_for_processes
 
             def apply_agent_config(config: AgentRuntimeConfig) -> None:
                 from .config import reload_settings
@@ -763,79 +1414,51 @@ def run(
                 updates = save_agent_runtime_config(config)
                 os.environ.update(updates)
                 reload_settings()
-                with log_lock:
-                    log_lines.append(
-                        _dashboard_log_line(
-                            "run",
-                            "config saved to .env; restarting DISPATCH to apply it",
-                        )
-                    )
-                restart_process("dispatcher")
+                append_run_line("config saved to .env; restarting runtime processes")
+                if settings.raw_wechat_enabled:
+                    if "raw-sync" not in supervisor.names():
+                        supervisor.start("raw-sync")
+                else:
+                    supervisor.stop("raw-sync")
+                supervisor.restart("live")
+                supervisor.restart("dispatcher")
 
             app = RunDashboard(
                 status_provider=lambda: status_lines_for_processes(
-                    process_rows(),
+                    supervisor.status_rows(),
                     load_agent_runtime_config(),
                 ),
                 log_buffer=log_lines,
                 agent_config_provider=load_agent_runtime_config,
                 agent_config_save=apply_agent_config,
             )
-            def watch_children() -> None:
-                while True:
-                    with process_lock:
-                        current_procs = list(procs.items())
-                        restarting = set(manual_restarts)
-                    for child_name, child_proc in current_procs:
-                        code = child_proc.poll()
-                        if code is not None:
-                            with process_lock:
-                                if child_name in restarting or procs.get(child_name) is not child_proc:
-                                    continue
-                            with log_lock:
-                                log_lines.append(
-                                    _dashboard_log_line(
-                                        "run",
-                                        f"{_dashboard_process_label(child_name)} exited with code {code}; stopping remaining processes",
-                                    )
-                                )
-                            try:
-                                app.call_from_thread(app.exit)
-                            except Exception:
-                                pass
-                            return
-                    time.sleep(1.0)
+
+            def on_critical_exit(name: str, code: int) -> None:
+                try:
+                    app.call_from_thread(app.exit)
+                except Exception:
+                    pass
 
             threading.Thread(
-                target=watch_children,
+                target=supervisor.watch_forever,
+                kwargs={"on_critical_exit": on_critical_exit},
                 name="wechat-oracle-run-watch",
                 daemon=True,
             ).start()
             app.run()
-            stop_requested = True
+        stop_requested = True
     except KeyboardInterrupt:
         stop_requested = True
     finally:
         if not stop_requested and not plain:
-            with log_lock:
-                log_lines.append(_dashboard_log_line("run", "stopping WeChat Oracle"))
+            append_run_line("stopping WeChat Oracle")
         if plain:
             typer.echo("stopping WeChat Oracle...")
-        with process_lock:
-            current_procs = list(procs.values())
-        for proc in current_procs:
-            _terminate_process_tree(proc)
-        deadline = time.time() + (2.0 if os.name == "nt" else 10.0)
-        for proc in current_procs:
-            while proc.poll() is None and time.time() < deadline:
-                time.sleep(0.1)
-            if proc.poll() is None:
-                _terminate_process_tree(proc, force=True)
+        supervisor.stop_all()
         if plain:
             typer.echo("stopped")
         else:
-            with log_lock:
-                log_lines.append(_dashboard_log_line("run", "stopped"))
+            append_run_line("stopped")
 
 
 @verify_app.command("roundtrip")
@@ -953,11 +1576,31 @@ def ingest_live() -> None:
     run_live()
 
 
+@ingest_app.command("ui-live")
+def ingest_ui_live() -> None:
+    """Read text/link events from exact visible WeChat groups via wx4py UIA."""
+    from .ingest.ui_live import run_ui_live
+    from .log_utils import setup_process_log
+    setup_process_log("live")
+    run_ui_live()
+
+
+@ingest_app.command("ui-probe")
+def ingest_ui_probe(
+    group: str = typer.Argument(..., help="Exact WeChat group display name"),
+) -> None:
+    """Open one group read-only and report wx4py compatibility; sends nothing."""
+    import json
+    from .ingest.ui_live import probe_ui_group
+    result = probe_ui_group(group)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("dispatcher")
 def dispatcher_cmd() -> None:
     """Watch DB for `@<bot> /find ...` commands; print results to stdout + log.
 
-    Requires WO_BOT_NAME and WO_LLM_API_KEY in .env. Runs in foreground;
+    Requires WO_BOT_NAME and a configured selected agent backend. Runs in foreground;
     Ctrl+C to stop. Safe to run alongside `ingest live`.
     """
     from .dispatcher import run_dispatcher
@@ -1330,10 +1973,11 @@ def openclaw_mcp_test() -> None:
 
     async def run() -> None:
         # mcp.client.stdio does NOT inherit parent env by default, so pass it
-        # through explicitly for PATH/HOME/etc. used by the spawned `uv run`.
+        # through explicitly for PATH/HOME/etc. used by the spawned process.
+        mcp_command = _self_command("openclaw", "mcp-serve")
         params = StdioServerParameters(
-            command="uv",
-            args=["run", "wechat-oracle", "openclaw", "mcp-serve"],
+            command=mcp_command[0],
+            args=mcp_command[1:],
             env=dict(os.environ),
         )
         async with stdio_client(params) as (read, write):
@@ -1420,6 +2064,8 @@ def openclaw_mcp_serve() -> None:
       openclaw mcp set wechat-oracle \\
         --command "uv" --args "run wechat-oracle openclaw mcp-serve"
 
+    A portable build uses ``WeChatOracle.exe openclaw mcp-serve`` instead.
+
     Exposes the full OpenClaw tool surface: history search, quote/forward
     expansion, media reads, and memory/persona read-write tools.
     """
@@ -1475,6 +2121,18 @@ def openclaw_ping(
     typer.echo(f"reply: {reply!r}")
     if usage:
         typer.echo(f"usage: {usage}")
+
+
+@app.command("gui")
+def gui() -> None:
+    """Open the desktop GUI (PySide6)."""
+    try:
+        from .gui import run_gui
+    except ImportError as exc:
+        raise typer.BadParameter(
+            "GUI 依赖未安装：请运行 `uv sync --extra gui` 后再启动。"
+        ) from exc
+    run_gui()
 
 
 @app.command("status")

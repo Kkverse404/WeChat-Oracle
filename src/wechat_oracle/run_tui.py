@@ -233,6 +233,346 @@ class MemoryEditorScreen(ModalScreen[MemoryEditResult | None]):
         )
 
 
+class MemberKnowledgeConsentScreen(ModalScreen[bool]):
+    """Explicit consent gate before archived chat is sent to the profile LLM."""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(self, *, message_count: int, member_count: int, estimated_calls: int) -> None:
+        super().__init__()
+        self._message_count = message_count
+        self._member_count = member_count
+        self._estimated_calls = estimated_calls
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static("启用成员知识库", id="config-value-title")
+            yield Static(
+                "启用后会把已选群的历史发言和派生画像发送给当前配置的 "
+                "OpenAI-compatible API。模型可推断敏感属性，这些画像可能用于群回复和总结。\n\n"
+                "保存配置并重启调度进程后，产品会自动在后台完整回放历史；中断可按成员游标续跑。"
+                "首次建库完成后，每个整点等待 5 分钟同步宽限，只更新上一小时有新发言的成员，"
+                "并让成员画像任务先于同周期群总结运行，无需手工执行 bootstrap。\n\n"
+                "只有聊天源提供了可靠昵称/成员 ID 才能按人建档和在摘要里点名；"
+                "缺少身份的消息只进入本群“未知成员”桶，产品不会猜名字。\n\n"
+                f"待处理约 {self._message_count} 条消息、{self._member_count} 位成员，"
+                f"预计至少 {self._estimated_calls} 次模型调用。",
+                id="config-value-help",
+            )
+            with Horizontal(id="config-value-buttons"):
+                yield Button("我理解并启用", id="member-kb-consent-confirm", variant="error")
+                yield Button("取消", id="member-kb-consent-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "member-kb-consent-confirm":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+@dataclass(frozen=True)
+class MemberSectionEditResult:
+    section: str
+    content: str
+    locked: bool
+
+
+class MemberSectionEditorScreen(ModalScreen[MemberSectionEditResult | None]):
+    BINDINGS = [("ctrl+s", "save", "保存"), ("escape", "cancel", "取消")]
+
+    def __init__(self, *, section: str, content: str, locked: bool) -> None:
+        super().__init__()
+        self._section = section
+        self._locked = locked
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="memory-editor"):
+            yield Static(f"编辑成员画像栏目：{self._section}", id="memory-editor-title")
+            yield Static(
+                "手工锁定后，定时画像模型不能覆盖此栏目。",
+                id="memory-editor-meta",
+            )
+            yield MemoryTextArea(self._content, id="member-section-text")
+            with Horizontal(id="memory-editor-actions"):
+                yield Button(
+                    f"锁定：{'是' if self._locked else '否'}",
+                    id="member-section-lock",
+                )
+                yield Button("保存", id="member-section-save", variant="primary")
+                yield Button("取消", id="member-section-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "member-section-lock":
+            self._locked = not self._locked
+            event.button.label = f"锁定：{'是' if self._locked else '否'}"
+        elif event.button.id == "member-section-save":
+            self.action_save()
+        else:
+            self.action_cancel()
+
+    def action_save(self) -> None:
+        self.dismiss(
+            MemberSectionEditResult(
+                section=self._section,
+                content=self.query_one("#member-section-text", TextArea).text,
+                locked=self._locked,
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class MemberKnowledgeActionConfirmScreen(ModalScreen[bool]):
+    def __init__(self, *, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static(self._title, id="config-value-title")
+            yield Static(self._body, id="config-value-help")
+            with Horizontal(id="config-value-buttons"):
+                yield Button("确认", id="member-action-confirm", variant="error")
+                yield Button("取消", id="member-action-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "member-action-confirm")
+
+
+class MemberKnowledgeScreen(ModalScreen[None]):
+    """Local browser/editor for one group's evidence-linked member profiles."""
+
+    BINDINGS = [("escape", "close", "关闭")]
+
+    def __init__(self, group: LocalAskGroup) -> None:
+        super().__init__()
+        self._group = group
+        self._members: list[dict] = []
+        self._selected: dict | None = None
+        self._profile: dict = {}
+        self._section_index = 0
+        self._sections = (
+            "identity", "interests", "skills", "communication_style", "habits",
+            "relationships", "opinions", "sensitive_inferences", "recent_focus",
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="memory-editor"):
+            yield Static(f"成员知识库 · {self._group.label}", id="memory-editor-title")
+            yield Static(
+                "⚠ 群聊原文与画像会发送给配置的模型 API；敏感推断可能进入群回复和总结。",
+                id="memory-editor-meta",
+            )
+            with Horizontal():
+                yield ListView(id="member-kb-members")
+                yield RichLog(id="member-kb-detail", wrap=True, highlight=False, markup=False)
+            with Horizontal(id="memory-editor-actions"):
+                yield Button("编辑栏目", id="member-kb-edit")
+                yield Button("切换栏目", id="member-kb-next-section")
+                yield Button("删除画像", id="member-kb-delete", variant="error")
+                yield Button("完整重建", id="member-kb-rebuild")
+                yield Button("刷新", id="member-kb-refresh")
+                yield Button("关闭", id="member-kb-close")
+
+    def on_mount(self) -> None:
+        self._reload_members()
+
+    def _reload_members(self) -> None:
+        from .member_knowledge import list_member_profiles
+
+        try:
+            with get_conn() as conn:
+                self._members = list_member_profiles(conn, self._group.group_id)
+        except Exception as exc:
+            self.query_one("#member-kb-detail", RichLog).write(
+                f"读取成员知识库失败：{type(exc).__name__}: {exc}"
+            )
+            return
+        view = self.query_one("#member-kb-members", ListView)
+        view.clear()
+        for index, item in enumerate(self._members):
+            name = item.get("display_name") or item.get("current_display_name") or item.get("sender_wxid") or "未知成员"
+            count = item.get("message_count", 0)
+            view.append(ListItem(Label(f"{name}  ·  {count} 条"), id=f"member-kb-row-{index}"))
+        if self._members:
+            self._select_member(0)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        if item_id.startswith("member-kb-row-"):
+            self._select_member(int(item_id.rsplit("-", 1)[1]))
+
+    def _select_member(self, index: int) -> None:
+        if not 0 <= index < len(self._members):
+            return
+        from .member_knowledge import get_member_profile, list_member_messages
+
+        self._selected = self._members[index]
+        sender = str(self._selected.get("sender_wxid") or "")
+        try:
+            with get_conn() as conn:
+                self._profile = get_member_profile(conn, self._group.group_id, sender) or {}
+                messages = list_member_messages(
+                    conn, self._group.group_id, sender, limit=50
+                )
+        except Exception as exc:
+            self.query_one("#member-kb-detail", RichLog).write(
+                f"读取画像失败：{type(exc).__name__}: {exc}"
+            )
+            return
+        self._render_detail(messages)
+
+    def _profile_sections(self) -> dict:
+        value = self._profile.get("profile") or self._profile.get("profile_json") or {}
+        if isinstance(value, str):
+            import json as _json
+            try:
+                value = _json.loads(value)
+            except Exception:
+                value = {}
+        return value if isinstance(value, dict) else {}
+
+    def _render_detail(self, messages: list[dict]) -> None:
+        import json as _json
+
+        log = self.query_one("#member-kb-detail", RichLog)
+        log.clear()
+        aliases = self._profile.get("aliases") or []
+        locked = set(self._profile.get("locked_sections") or [])
+        log.write(f"成员：{self._profile.get('display_name') or self._profile.get('current_display_name') or self._profile.get('sender_wxid')}")
+        log.write(f"wxid：{self._profile.get('sender_wxid')}  昵称历史：{', '.join(map(str, aliases)) or '-'}")
+        log.write(f"总画像：{self._profile.get('summary_text') or '(尚未生成)'}")
+        log.write("\n结构化画像：")
+        for section in self._sections:
+            marker = " [已锁定]" if section in locked else ""
+            value = self._profile_sections().get(section, "")
+            log.write(f"- {section}{marker}: {value or '-'}")
+        log.write("\n结论与证据：")
+        for claim in self._profile.get("claims") or []:
+            text = claim.get("claim_text") or claim.get("text") or ""
+            evidence = claim.get("evidence_msg_ids") or claim.get("evidence") or []
+            log.write(
+                f"- [{claim.get('status','current')}] {text} · {claim.get('basis','?')} "
+                f"· confidence={claim.get('confidence','?')} · sensitive={bool(claim.get('sensitive'))} "
+                f"· evidence={_json.dumps(evidence, ensure_ascii=False)}"
+            )
+        log.write("\n最近原始消息（本地读取）：")
+        for message in messages:
+            body = message.get("content_text") or message.get("transcript") or ""
+            log.write(f"#{message.get('msg_id')} {message.get('t')}  {body}")
+
+    def _write_detail(self, text: str) -> None:
+        self.query_one("#member-kb-detail", RichLog).write(text)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "member-kb-close":
+                self.dismiss(None)
+            case "member-kb-refresh":
+                self._reload_members()
+            case "member-kb-next-section":
+                self._section_index = (self._section_index + 1) % len(self._sections)
+                event.button.label = f"栏目：{self._sections[self._section_index]}"
+            case "member-kb-edit":
+                self._edit_section()
+            case "member-kb-delete":
+                if self._selected:
+                    self.app.push_screen(
+                        MemberKnowledgeActionConfirmScreen(
+                            title="删除派生画像",
+                            body="只删除画像、结论和更新游标；原始群聊消息永久保留。",
+                        ),
+                        self._on_delete_confirmed,
+                    )
+            case "member-kb-rebuild":
+                if self._selected:
+                    self.app.push_screen(
+                        MemberKnowledgeActionConfirmScreen(
+                            title="完整历史重建",
+                            body="将清除派生画像并重新把该成员全部历史发言发送给模型 API。",
+                        ),
+                        self._on_rebuild_confirmed,
+                    )
+
+    def _edit_section(self) -> None:
+        if not self._selected:
+            return
+        section = self._sections[self._section_index]
+        self.app.push_screen(
+            MemberSectionEditorScreen(
+                section=section,
+                content=str(self._profile_sections().get(section) or ""),
+                locked=section in set(self._profile.get("locked_sections") or []),
+            ),
+            self._on_section_edited,
+        )
+
+    def _on_section_edited(self, result: MemberSectionEditResult | None) -> None:
+        if result is None or not self._selected:
+            return
+        from .member_knowledge import update_member_profile_section
+
+        sender = str(self._selected.get("sender_wxid") or "")
+        with get_conn() as conn:
+            update_member_profile_section(
+                conn, self._group.group_id, sender,
+                result.section, result.content, locked=result.locked,
+            )
+        self._reload_members()
+
+    def _on_delete_confirmed(self, accepted: bool) -> None:
+        if not accepted or not self._selected:
+            return
+        from .member_knowledge import delete_member_profile
+
+        sender = str(self._selected.get("sender_wxid") or "")
+        with get_conn() as conn:
+            delete_member_profile(conn, self._group.group_id, sender, keep_messages=True)
+        self._reload_members()
+
+    def _on_rebuild_confirmed(self, accepted: bool) -> None:
+        if not accepted or not self._selected:
+            return
+        sender = str(self._selected.get("sender_wxid") or "")
+        self.query_one("#member-kb-detail", RichLog).write("重建任务已启动……")
+
+        def worker() -> None:
+            from .llm import build_llm_client
+            from .member_knowledge import reset_member_profile, run_member_update
+
+            try:
+                with get_conn() as conn:
+                    reset_member_profile(conn, self._group.group_id, sender)
+                    llm = build_llm_client(
+                        provider=settings.llm_provider,
+                        api_key=settings.llm_api_key,
+                        endpoint=settings.llm_endpoint,
+                        json_mode=settings.llm_json_mode,
+                    )
+                    run_member_update(
+                        conn, self._group.group_id, sender, llm,
+                        chunk_chars=settings.member_kb_chunk_chars,
+                        retries=settings.member_kb_retries,
+                    )
+                self.app.call_from_thread(self._reload_members)
+            except Exception as exc:
+                self.app.call_from_thread(
+                    self._write_detail,
+                    f"重建失败：{type(exc).__name__}",
+                )
+
+        threading.Thread(target=worker, daemon=True, name="member-kb-rebuild").start()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class ConfigValueScreen(ModalScreen[str | None]):
     """Edit one config value in a small, focused dialog."""
 
@@ -240,15 +580,16 @@ class ConfigValueScreen(ModalScreen[str | None]):
         ("escape", "cancel", "取消"),
     ]
 
-    def __init__(self, *, title: str, value: str) -> None:
+    def __init__(self, *, title: str, value: str, password: bool = False) -> None:
         super().__init__()
         self._title = title
         self._value = value
+        self._password = password
 
     def compose(self) -> ComposeResult:
         with Vertical(id="config-value-editor"):
             yield Static(self._title, id="config-value-title")
-            yield Input(value=self._value, id="config-value-input")
+            yield Input(value=self._value, password=self._password, id="config-value-input")
             with Horizontal(id="config-value-buttons"):
                 yield Button("确定", id="config-value-save", variant="primary")
                 yield Button("取消", id="config-value-cancel")
@@ -275,8 +616,78 @@ class ConfigValueScreen(ModalScreen[str | None]):
         self.dismiss(self.query_one("#config-value-input", Input).value.strip())
 
 
+class ConfigGroupSelectionScreen(ModalScreen[tuple[str, ...] | None]):
+    """Select exact canonical groups from the local authorization table."""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        options: tuple[tuple[str, str], ...],
+        selected: tuple[str, ...],
+    ) -> None:
+        super().__init__()
+        self._options = options
+        self._selected = set(selected)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config-value-editor"):
+            yield Static("选择自动归档与总结的群", id="config-value-title")
+            if not self._options:
+                yield Static(
+                    "还没有已授权群。先运行 WeChatOracle.exe raw groups，"
+                    "再用 raw authorize <canonical-id> 授权。",
+                    id="config-value-help",
+                )
+            for index, (group_id, name) in enumerate(self._options):
+                marker = "☑" if group_id in self._selected else "☐"
+                yield Button(
+                    f"{marker} {name}  {_clip(group_id, 32)}",
+                    id=f"config-group-{index}",
+                    classes="config-menu-item",
+                    compact=True,
+                )
+            with Horizontal(id="config-value-buttons"):
+                yield Button("确定", id="config-groups-save", variant="primary")
+                yield Button("取消", id="config-groups-cancel")
+
+    def on_mount(self) -> None:
+        controls = self._controls()
+        if controls:
+            controls[0].focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id or ""
+        if button_id.startswith("config-group-"):
+            index = int(button_id.removeprefix("config-group-"))
+            group_id, name = self._options[index]
+            if group_id in self._selected:
+                self._selected.remove(group_id)
+                marker = "☐"
+            else:
+                self._selected.add(group_id)
+                marker = "☑"
+            event.button.label = f"{marker} {name}  {_clip(group_id, 32)}"
+        elif button_id == "config-groups-save":
+            ordered = tuple(group_id for group_id, _ in self._options if group_id in self._selected)
+            self.dismiss(ordered)
+        elif button_id == "config-groups-cancel":
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _controls(self) -> list[Button]:
+        return [
+            *[self.query_one(f"#config-group-{index}", Button) for index in range(len(self._options))],
+            self.query_one("#config-groups-save", Button),
+            self.query_one("#config-groups-cancel", Button),
+        ]
+
+
 class ConfigBackendScreen(ModalScreen[str | None]):
-    """Pick native/openclaw in a dedicated option dialog."""
+    """Pick native/openclaw/pi in a dedicated option dialog."""
 
     BINDINGS = [
         ("escape", "cancel", "取消"),
@@ -290,6 +701,7 @@ class ConfigBackendScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         native_state = "已配置" if self._config.native_configured else "不可用：缺少 WO_LLM_API_KEY"
         openclaw_state = "已配置" if self._config.openclaw_token_configured else "不可用：缺少 WO_OPENCLAW_TOKEN"
+        pi_state = "已配置" if self._config.pi_configured else "不可用：找不到 Pi CLI"
         with Vertical(id="config-backend-picker"):
             yield Static("选择 Agent 后端", id="config-backend-title")
             yield Button(
@@ -306,12 +718,22 @@ class ConfigBackendScreen(ModalScreen[str | None]):
                 disabled=not self._config.openclaw_token_configured,
                 compact=True,
             )
+            yield Button(
+                f"{_current_marker(self._current, 'pi')}Pi：本机隔离 RPC（{pi_state}）",
+                id="config-backend-pi",
+                classes="config-menu-item",
+                disabled=not self._config.pi_configured,
+                compact=True,
+            )
             with Horizontal(id="config-backend-buttons"):
                 yield Button("取消", id="config-cancel", compact=True)
             yield Static("点击一个选项，或用 Tab/方向键切换后按回车；Esc 取消", id="config-backend-help")
 
     def on_mount(self) -> None:
-        target_id = "#config-backend-openclaw" if self._current == "openclaw" else "#config-backend-native"
+        target_id = {
+            "openclaw": "#config-backend-openclaw",
+            "pi": "#config-backend-pi",
+        }.get(self._current, "#config-backend-native")
         try:
             target = self.query_one(target_id, Button)
             if not target.disabled:
@@ -335,6 +757,8 @@ class ConfigBackendScreen(ModalScreen[str | None]):
             self.dismiss("native")
         elif event.button.id == "config-backend-openclaw":
             self.dismiss("openclaw")
+        elif event.button.id == "config-backend-pi":
+            self.dismiss("pi")
         elif event.button.id == "config-cancel":
             self.action_cancel()
 
@@ -542,7 +966,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def __init__(self, config: AgentRuntimeConfig) -> None:
         super().__init__()
         self._config = config
-        self._backend = config.backend if config.backend in {"native", "openclaw"} else "native"
+        self._backend = "native"
         self._proactive_mode = (
             config.proactive_mode
             if config.proactive_mode in {"off", "reactive", "proactive"}
@@ -559,23 +983,39 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self._continuation_delay_seconds = int(config.continuation_delay_seconds)
         self._continuation_ttl_seconds = int(config.continuation_ttl_seconds)
         self._llm_model = config.llm_model
+        self._llm_endpoint = config.llm_endpoint
+        self._llm_api_key_update: str | None = None
+        self._groups = tuple(config.groups)
+        self._raw_wechat_enabled = bool(config.raw_wechat_enabled)
+        self._raw_wechat_account = config.raw_wechat_account
+        self._hourly_summary_enabled = bool(config.hourly_summary_enabled)
+        self._daily_summary_enabled = bool(config.daily_summary_enabled)
+        self._member_kb_enabled = bool(config.member_kb_enabled)
         self._openclaw_agent_id = config.openclaw_agent_id
 
     def compose(self) -> ComposeResult:
         native_state = "已配置" if self._config.native_configured else "缺少 WO_LLM_API_KEY"
-        openclaw_state = (
-            "已配置"
-            if self._config.openclaw_configured
-            else "缺少 WO_OPENCLAW_TOKEN 或 WO_OPENCLAW_AGENT_ID"
-        )
         with Vertical(id="config-editor"):
             yield Static("运行配置", id="config-editor-title")
             yield Static(
-                f"Native：{native_state}　OpenClaw：{openclaw_state}",
+                f"SQLite 本地记忆库 + OpenAI 兼容 API：{native_state}",
                 id="config-editor-meta",
             )
             yield Static("改完后需要保存才会写入 .env，并重启调度进程。", id="config-editor-save-hint")
-            yield Button("", id="config-menu-backend", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-api-endpoint", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-api-key", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-groups", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-raw-enabled", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-raw-account", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-hourly-summary", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-daily-summary", classes="config-menu-item", compact=True)
+            yield Button("", id="config-menu-member-kb", classes="config-menu-item", compact=True)
+            yield Static(
+                "隐私提示：成员知识库会把群聊原文和画像发送给已配置的模型 API；"
+                "敏感推断可能用于群回复和总结。",
+                id="config-member-kb-warning",
+            )
             yield Button("", id="config-menu-proactive-mode", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-probability", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-mention-policy", classes="config-menu-item", compact=True)
@@ -583,8 +1023,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             yield Button("", id="config-menu-continuation-max", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-continuation-delay", classes="config-menu-item", compact=True)
             yield Button("", id="config-menu-continuation-ttl", classes="config-menu-item", compact=True)
-            yield Button("", id="config-menu-native-model", classes="config-menu-item", compact=True)
-            yield Button("", id="config-menu-openclaw-agent", classes="config-menu-item", compact=True)
             yield Button(
                 "保存到 .env，并重启调度进程",
                 id="config-menu-save",
@@ -600,7 +1038,7 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def on_mount(self) -> None:
         self._refresh_menu()
-        self.query_one("#config-menu-backend", Button).focus()
+        self.query_one("#config-menu-api-endpoint", Button).focus()
 
     def on_key(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.key == "down":
@@ -613,11 +1051,58 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         match event.button.id:
-            case "config-menu-backend":
+            case "config-menu-api-endpoint":
                 self.app.push_screen(
-                    ConfigBackendScreen(self._config, self._backend),
-                    self._on_backend_changed,
+                    ConfigValueScreen(title="OpenAI 兼容 API 地址", value=self._llm_endpoint),
+                    self._on_llm_endpoint_changed,
                 )
+            case "config-menu-api-key":
+                self.app.push_screen(
+                    ConfigValueScreen(title="API Key（留空则保留当前值）", value="", password=True),
+                    self._on_llm_api_key_changed,
+                )
+            case "config-menu-native-model":
+                self.app.push_screen(
+                    ConfigValueScreen(title="模型名称", value=self._llm_model),
+                    self._on_llm_model_changed,
+                )
+            case "config-menu-groups":
+                self.app.push_screen(
+                    ConfigGroupSelectionScreen(self._config.available_groups, self._groups),
+                    self._on_groups_changed,
+                )
+            case "config-menu-raw-enabled":
+                self._raw_wechat_enabled = not self._raw_wechat_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-raw-account":
+                self.app.push_screen(
+                    ConfigValueScreen(title="微信账号匿名指纹", value=self._raw_wechat_account),
+                    self._on_raw_account_changed,
+                )
+            case "config-menu-hourly-summary":
+                self._hourly_summary_enabled = not self._hourly_summary_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-daily-summary":
+                self._daily_summary_enabled = not self._daily_summary_enabled
+                self._refresh_menu()
+                self._mark_dirty()
+            case "config-menu-member-kb":
+                if self._member_kb_enabled:
+                    self._member_kb_enabled = False
+                    self._refresh_menu()
+                    self._mark_dirty()
+                else:
+                    message_count, member_count, estimated_calls = self._member_kb_estimate()
+                    self.app.push_screen(
+                        MemberKnowledgeConsentScreen(
+                            message_count=message_count,
+                            member_count=member_count,
+                            estimated_calls=estimated_calls,
+                        ),
+                        self._on_member_kb_consent,
+                    )
             case "config-menu-proactive-mode":
                 self.app.push_screen(
                     ConfigProactiveModeScreen(self._proactive_mode),
@@ -664,16 +1149,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                     ),
                     self._on_continuation_ttl_changed,
                 )
-            case "config-menu-native-model":
-                self.app.push_screen(
-                    ConfigValueScreen(title="Native 模型", value=self._llm_model),
-                    self._on_llm_model_changed,
-                )
-            case "config-menu-openclaw-agent":
-                self.app.push_screen(
-                    ConfigValueScreen(title="OpenClaw Agent ID", value=self._openclaw_agent_id),
-                    self._on_openclaw_agent_changed,
-                )
             case "config-menu-save":
                 self.action_save()
             case "config-menu-cancel":
@@ -681,18 +1156,27 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def action_save(self) -> None:
         llm_model = self._llm_model.strip()
+        llm_endpoint = self._llm_endpoint.strip()
         openclaw_agent = self._openclaw_agent_id.strip()
         if not llm_model:
             self.query_one("#config-editor-help", Static).update("Native 模型不能为空")
             return
-        if not openclaw_agent:
+        if self._backend == "openclaw" and not openclaw_agent:
             self.query_one("#config-editor-help", Static).update("OpenClaw Agent ID 不能为空")
             return
-        if self._backend == "native" and not self._config.native_configured:
+        if not llm_endpoint:
+            self.query_one("#config-editor-help", Static).update("API 地址不能为空")
+            return
+        if self._backend == "native" and not (
+            self._config.native_configured or self._llm_api_key_update
+        ):
             self.query_one("#config-editor-help", Static).update("Native 缺少 WO_LLM_API_KEY，不能切换")
             return
-        if self._backend == "openclaw" and not self._config.openclaw_token_configured:
-            self.query_one("#config-editor-help", Static).update("OpenClaw 缺少 WO_OPENCLAW_TOKEN，不能切换")
+        if self._raw_wechat_enabled and not self._raw_wechat_account:
+            self.query_one("#config-editor-help", Static).update("启用本地聊天库前请先选择账号指纹")
+            return
+        if (self._hourly_summary_enabled or self._daily_summary_enabled) and not self._groups:
+            self.query_one("#config-editor-help", Static).update("启用自动总结前至少选择一个已授权群")
             return
         if self._continuation_ttl_seconds < self._continuation_delay_seconds:
             self.query_one("#config-editor-help", Static).update("Continuation TTL must be >= delay")
@@ -712,6 +1196,20 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
                 native_configured=self._config.native_configured,
                 openclaw_token_configured=self._config.openclaw_token_configured,
                 openclaw_configured=self._config.openclaw_configured,
+                pi_configured=self._config.pi_configured,
+                llm_endpoint=llm_endpoint,
+                llm_api_key_update=self._llm_api_key_update,
+                groups=self._groups,
+                available_groups=self._config.available_groups,
+                raw_wechat_enabled=self._raw_wechat_enabled,
+                raw_wechat_account=self._raw_wechat_account,
+                hourly_summary_enabled=self._hourly_summary_enabled,
+                daily_summary_enabled=self._daily_summary_enabled,
+                member_kb_enabled=self._member_kb_enabled,
+                member_kb_interval_seconds=self._config.member_kb_interval_seconds,
+                member_kb_chunk_chars=self._config.member_kb_chunk_chars,
+                member_kb_max_concurrency=self._config.member_kb_max_concurrency,
+                member_kb_retries=self._config.member_kb_retries,
             )
         )
 
@@ -784,6 +1282,65 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._refresh_menu()
             self._mark_dirty()
 
+    def _on_llm_endpoint_changed(self, value: str | None) -> None:
+        if value is not None:
+            self._llm_endpoint = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_llm_api_key_changed(self, value: str | None) -> None:
+        if value:
+            self._llm_api_key_update = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_groups_changed(self, value: tuple[str, ...] | None) -> None:
+        if value is not None:
+            self._groups = value
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_raw_account_changed(self, value: str | None) -> None:
+        if value is not None:
+            self._raw_wechat_account = value.strip().lower()
+            self._refresh_menu()
+            self._mark_dirty()
+
+    def _on_member_kb_consent(self, accepted: bool) -> None:
+        if not accepted:
+            return
+        self._member_kb_enabled = True
+        self._refresh_menu()
+        self._mark_dirty()
+
+    def _member_kb_estimate(self) -> tuple[int, int, int]:
+        if not self._groups:
+            return (0, 0, 0)
+        names = dict(self._config.available_groups)
+        selectors = tuple(dict.fromkeys([*self._groups, *(names.get(item, item) for item in self._groups)]))
+        placeholders = ",".join("?" for _ in selectors)
+        try:
+            with get_conn() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS message_count,
+                           COUNT(DISTINCT group_id || char(31) ||
+                               COALESCE(NULLIF(TRIM(sender_wxid), ''), '__unknown__')) AS member_count,
+                           COALESCE(SUM(LENGTH(COALESCE(content_text, '')) +
+                                        LENGTH(COALESCE(transcript, ''))), 0) AS content_chars
+                      FROM messages
+                     WHERE group_id IN ({placeholders}) OR group_name IN ({placeholders})
+                    """,
+                    [*selectors, *selectors],
+                ).fetchone()
+        except Exception:
+            return (0, 0, 0)
+        message_count = int(row["message_count"] or 0)
+        member_count = int(row["member_count"] or 0)
+        content_chars = int(row["content_chars"] or 0)
+        chunks = (content_chars + self._config.member_kb_chunk_chars - 1) // self._config.member_kb_chunk_chars
+        return (message_count, member_count, max(member_count, chunks) if message_count else 0)
+
     def _on_openclaw_agent_changed(self, value: str | None) -> None:
         if value is not None:
             self._openclaw_agent_id = value
@@ -791,8 +1348,33 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self._mark_dirty()
 
     def _refresh_menu(self) -> None:
-        self.query_one("#config-menu-backend", Button).label = (
-            f"Agent 后端　{_backend_label(self._backend)}"
+        self.query_one("#config-menu-api-endpoint", Button).label = (
+            f"模型 API　{_clip(self._llm_endpoint, 52)}"
+        )
+        key_state = "本次将更新" if self._llm_api_key_update else (
+            "已配置" if self._config.native_configured else "未配置"
+        )
+        self.query_one("#config-menu-api-key", Button).label = f"API Key　{key_state}"
+        self.query_one("#config-menu-native-model", Button).label = (
+            f"模型　{_clip(self._llm_model, 52)}"
+        )
+        self.query_one("#config-menu-groups", Button).label = (
+            f"已选群　{len(self._groups)}/{len(self._config.available_groups)}"
+        )
+        self.query_one("#config-menu-raw-enabled", Button).label = (
+            f"本地聊天库　{'on' if self._raw_wechat_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-raw-account", Button).label = (
+            f"微信账号　{self._raw_wechat_account or '未选择'}"
+        )
+        self.query_one("#config-menu-hourly-summary", Button).label = (
+            f"每小时总结　{'on' if self._hourly_summary_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-daily-summary", Button).label = (
+            f"午夜每日总结　{'on' if self._daily_summary_enabled else 'off'}"
+        )
+        self.query_one("#config-menu-member-kb", Button).label = (
+            f"成员知识库　{'on' if self._member_kb_enabled else 'off'}"
         )
         self.query_one("#config-menu-proactive-mode", Button).label = (
             f"主动模式　{_proactive_mode_label(self._proactive_mode)}"
@@ -815,12 +1397,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
         self.query_one("#config-menu-continuation-ttl", Button).label = (
             f"Follow-up TTL：{self._continuation_ttl_seconds}s"
         )
-        self.query_one("#config-menu-native-model", Button).label = (
-            f"Native 模型　{_clip(self._llm_model, 52)}"
-        )
-        self.query_one("#config-menu-openclaw-agent", Button).label = (
-            f"OpenClaw Agent ID　{_clip(self._openclaw_agent_id, 48)}"
-        )
 
     def _mark_dirty(self) -> None:
         self.query_one("#config-editor-save-hint", Static).update(
@@ -829,7 +1405,15 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
 
     def _focus_controls(self) -> list[Button]:
         return [
-            self.query_one("#config-menu-backend", Button),
+            self.query_one("#config-menu-api-endpoint", Button),
+            self.query_one("#config-menu-api-key", Button),
+            self.query_one("#config-menu-native-model", Button),
+            self.query_one("#config-menu-groups", Button),
+            self.query_one("#config-menu-raw-enabled", Button),
+            self.query_one("#config-menu-raw-account", Button),
+            self.query_one("#config-menu-hourly-summary", Button),
+            self.query_one("#config-menu-daily-summary", Button),
+            self.query_one("#config-menu-member-kb", Button),
             self.query_one("#config-menu-proactive-mode", Button),
             self.query_one("#config-menu-probability", Button),
             self.query_one("#config-menu-mention-policy", Button),
@@ -837,8 +1421,6 @@ class ConfigScreen(ModalScreen[AgentRuntimeConfig | None]):
             self.query_one("#config-menu-continuation-max", Button),
             self.query_one("#config-menu-continuation-delay", Button),
             self.query_one("#config-menu-continuation-ttl", Button),
-            self.query_one("#config-menu-native-model", Button),
-            self.query_one("#config-menu-openclaw-agent", Button),
             self.query_one("#config-menu-save", Button),
             self.query_one("#config-menu-cancel", Button),
         ]
@@ -881,7 +1463,7 @@ class RunDashboard(App[None]):
         background: #070b10;
     }
 
-    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigProactiveModeScreen, ConfigMentionPolicyScreen, ConfigValueScreen {
+    GroupPickerScreen, AskScreen, MemoryEditorScreen, ConfigScreen, ConfigBackendScreen, ConfigProactiveModeScreen, ConfigMentionPolicyScreen, ConfigValueScreen, ConfigGroupSelectionScreen {
         align: center middle;
     }
 
@@ -972,7 +1554,8 @@ class RunDashboard(App[None]):
 
     #config-editor {
         width: 92;
-        height: 20;
+        height: 90%;
+        overflow-y: auto;
         padding: 1 2;
         border: round #5ccfe6;
         background: #0b1118;
@@ -1086,6 +1669,11 @@ class RunDashboard(App[None]):
         background: #0b1118;
     }
 
+    ConfigGroupSelectionScreen #config-value-editor {
+        height: 90%;
+        overflow-y: auto;
+    }
+
     #config-value-title {
         height: 1;
         text-style: bold;
@@ -1112,6 +1700,7 @@ class RunDashboard(App[None]):
         ("a", "ask_selected_group", "询问"),
         ("g", "select_group", "选群"),
         ("m", "edit_memory", "记忆"),
+        ("k", "member_knowledge", "成员库"),
         ("c", "edit_config", "配置"),
         ("w", "toggle_write_mode", "写入"),
         ("q", "quit", "退出"),
@@ -1211,6 +1800,14 @@ class RunDashboard(App[None]):
             ),
             self._on_memory_editor_saved,
         )
+
+    def action_member_knowledge(self) -> None:
+        if self._selected_group is None:
+            self._select_default_group()
+        if self._selected_group is None:
+            self._append_local("请先按 g 选择群")
+            return
+        self.push_screen(MemberKnowledgeScreen(self._selected_group))
 
     def action_edit_config(self) -> None:
         try:
@@ -1412,7 +2009,8 @@ def status_lines_for_processes(
     backend = (agent_config.backend or "native").lower()
     agent_label = (
         f"openclaw/{agent_config.openclaw_agent_id}"
-        if backend == "openclaw" else f"native/{agent_config.llm_model}"
+        if backend == "openclaw"
+        else (f"pi/{settings.pi_model}" if backend == "pi" else f"native/{agent_config.llm_model}")
     )
     balance_label = _balance_label(backend, native_configured=agent_config.native_configured)
     proc_bits = []
@@ -1427,6 +2025,7 @@ def status_lines_for_processes(
     bot_label = settings.bot_name or "unset"
     reply_label = _tag(settings.reply_backend, _OK_STYLE) if settings.reply else _tag("off", _MUTED_STYLE)
     lurk_label = _tag("on", _OK_STYLE) if settings.agent_lurk_enabled else _tag("off", _MUTED_STYLE)
+    member_kb_label = _tag("on", _WARN_STYLE) if agent_config.member_kb_enabled else _tag("off", _MUTED_STYLE)
     stance_label = _proactive_status_label(agent_config.proactive_mode)
     wake_label = _wake_status_label(
         agent_config.agent_base_probability, agent_config.proactive_mode
@@ -1443,7 +2042,7 @@ def status_lines_for_processes(
         ),
         _status_row(
             "AMBIENT",
-            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} cont {continuation_label} {_SEP} lurk {lurk_label}",
+            f"stance {stance_label} {_SEP} wake {wake_label} {_SEP} cont {continuation_label} {_SEP} lurk {lurk_label} {_SEP} member-kb {member_kb_label}",
         ),
         _status_row(
             "WATCH",
