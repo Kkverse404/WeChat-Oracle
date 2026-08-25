@@ -614,10 +614,9 @@ def build_active_member_context(
     for row in rows:
         member = str(row["member"])
         count = int(row["message_count"] or 0)
-        # Unknown senders are intentionally represented only as an aggregate;
-        # no profile data is personalized to a member whose identity is absent.
+        # Unknown senders provide no safe personalization signal and exposing
+        # their internal bucket label makes model output sound broken.
         if member == UNKNOWN_MEMBER_ID:
-            chunks.append(f"[unknown participants] {count} message(s)")
             continue
         profile = get_member_profile(conn, group_id, member)
         label = (profile or {}).get("display_name") or row["latest_display"] or member

@@ -219,7 +219,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON delivery_outbox(status, updated_at)"
     )
     conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('version', '5') "
+        "INSERT INTO schema_meta(key, value) VALUES('version', '6') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
 
@@ -233,6 +233,20 @@ def _migrate_member_knowledge(conn: sqlite3.Connection) -> None:
     )
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS ui_group_members (
+            group_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            synthetic_id TEXT NOT NULL,
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            source TEXT NOT NULL DEFAULT 'wx4py-roster',
+            PRIMARY KEY(group_id, display_name),
+            UNIQUE(group_id, synthetic_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ui_group_members_active
+            ON ui_group_members(group_id, active, display_name);
+
         CREATE TABLE IF NOT EXISTS member_profiles (
             group_id TEXT NOT NULL,
             sender_wxid TEXT NOT NULL,

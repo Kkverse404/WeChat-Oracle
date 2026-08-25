@@ -36,6 +36,7 @@ def test_raw_sync_skips_blocking_visible_history(monkeypatch) -> None:
 
     monkeypatch.setattr(settings, "groups", ["测试群"])
     monkeypatch.setattr(settings, "raw_wechat_enabled", True)
+    monkeypatch.setattr(settings, "ui_sender_identity_enabled", False)
     monkeypatch.setattr("wechat_oracle.ingest.ui_live.init_db", lambda: None)
     monkeypatch.setattr("wx4py.WeChatClient", FakeClient)
     monkeypatch.setattr(

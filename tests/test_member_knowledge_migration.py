@@ -57,5 +57,5 @@ def test_member_knowledge_migration_is_additive(tmp_path):
         assert migrated.execute("SELECT content_text FROM messages").fetchone()[0] == "keep"
         assert migrated.execute(
             "SELECT value FROM schema_meta WHERE key='version'"
-        ).fetchone()[0] == "5"
+        ).fetchone()[0] == "6"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []

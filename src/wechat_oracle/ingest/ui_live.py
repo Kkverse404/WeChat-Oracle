@@ -15,9 +15,15 @@ from datetime import datetime, timedelta
 from loguru import logger
 
 from ..config import settings
-from ..db import get_conn, init_db
+from ..db import get_conn, init_db, transaction
 from ..models import Message, MsgType
 from .group_identity import canonical_group_id, ui_group_id
+from .ui_identity import (
+    load_ui_roster,
+    recognize_control_sender,
+    save_ui_roster,
+    stable_ui_member_id,
+)
 from .writer import write_messages
 
 
@@ -77,6 +83,25 @@ def _backfill_visible_history(wx, groups: list[str]) -> None:
             logger.info("ui ingest: backfilled {} visible rows for {!r}", len(messages), group)
 
 
+def _sync_visible_rosters(wx, groups: list[str]) -> dict[str, list[str]]:
+    rosters: dict[str, list[str]] = {}
+    for group in groups:
+        try:
+            members = wx.group_manager.get_group_members(group)
+            with get_conn() as conn:
+                group_id = canonical_group_id(conn, group)
+                with transaction(conn):
+                    names = save_ui_roster(conn, group_id, members)
+            rosters[group] = names
+            logger.info("ui ingest: roster synced for {!r}: {} member(s)", group, len(names))
+        except Exception as exc:
+            logger.warning("ui ingest: roster sync failed for {!r}: {}", group, exc)
+            with get_conn() as conn:
+                group_id = canonical_group_id(conn, group)
+                rosters[group] = load_ui_roster(conn, group_id)
+    return rosters
+
+
 def run_ui_live() -> None:
     if not settings.groups:
         raise RuntimeError("WO_GROUPS must contain exact group display names for wx4py ingest")
@@ -91,6 +116,7 @@ def run_ui_live() -> None:
     logger.info("ui ingest: connecting to visible WeChat")
     wx.connect()
     try:
+        rosters = _sync_visible_rosters(wx, settings.groups) if settings.ui_sender_identity_enabled else {}
         # The raw watcher already provides complete history and stable sender
         # identity. Re-reading up to 5000 UI rows here is redundant and can
         # block startup indefinitely in a busy group, preventing the listener
@@ -115,10 +141,33 @@ def run_ui_live() -> None:
             class_name = str(getattr(event.raw, "ClassName", "") or "")
             msg_type = MsgType.TEXT if "Text" in class_name else MsgType.LINK
             with get_conn() as conn:
+                group_id = canonical_group_id(conn, event.group)
+                sender_display = None
+                sender_wxid = None
+                if settings.ui_sender_identity_enabled:
+                    sender_display, confidence = recognize_control_sender(
+                        event.raw,
+                        rosters.get(event.group, []),
+                    )
+                    if sender_display:
+                        sender_wxid = stable_ui_member_id(group_id, sender_display)
+                        logger.info(
+                            "ui ingest: sender identified for {!r}: {!r} ({:.2f})",
+                            event.group,
+                            sender_display,
+                            confidence,
+                        )
+                    else:
+                        logger.warning(
+                            "ui ingest: sender unresolved for {!r}; message remains anonymous",
+                            event.group,
+                        )
                 message = Message(
                     wx_msg_id=f"ui-live:{event_key}",
-                    group_id=canonical_group_id(conn, event.group),
+                    group_id=group_id,
                     group_name=event.group,
+                    sender_wxid=sender_wxid,
+                    sender_display=sender_display,
                     t=int(event.timestamp),
                     type=msg_type,
                     content_text=content,

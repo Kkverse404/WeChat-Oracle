@@ -293,6 +293,23 @@ CREATE TABLE IF NOT EXISTS member_profiles (
 CREATE INDEX IF NOT EXISTS idx_member_profiles_group
     ON member_profiles(group_id, updated_at);
 
+-- Display-name roster for the UI-only backend.  WeChat's accessibility API
+-- does not expose wxids, so these identities remain explicitly synthetic and
+-- scoped to one group.
+CREATE TABLE IF NOT EXISTS ui_group_members (
+    group_id       TEXT NOT NULL,
+    display_name   TEXT NOT NULL,
+    synthetic_id   TEXT NOT NULL,
+    first_seen_at  REAL NOT NULL,
+    last_seen_at   REAL NOT NULL,
+    active         INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    source         TEXT NOT NULL DEFAULT 'wx4py-roster',
+    PRIMARY KEY(group_id, display_name),
+    UNIQUE(group_id, synthetic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ui_group_members_active
+    ON ui_group_members(group_id, active, display_name);
+
 CREATE TABLE IF NOT EXISTS member_alias_history (
     group_id      TEXT NOT NULL,
     sender_wxid   TEXT NOT NULL,
@@ -409,5 +426,5 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '5');
-UPDATE schema_meta SET value = '5' WHERE key = 'version';
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '6');
+UPDATE schema_meta SET value = '6' WHERE key = 'version';

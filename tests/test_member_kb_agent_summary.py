@@ -7,7 +7,7 @@ from wechat_oracle.agent.tools_read import ReadMemberProfileTool, SearchMemberPr
 from wechat_oracle.config import settings
 from wechat_oracle.daily_summary import run_summary_group
 from wechat_oracle.db import get_conn, init_db
-from wechat_oracle.member_knowledge import update_member_profile_section
+from wechat_oracle.member_knowledge import build_active_member_context, update_member_profile_section
 from wechat_oracle.time_ranges import SummaryPeriod
 
 
@@ -101,3 +101,12 @@ def test_summary_context_contains_only_active_participants_and_is_background(tmp
     assert "Active member background context" in prompt
     assert "raw chat messages in the requested period are the event source" in prompt
     assert "old profile claims or evidence as events that happened in this period" in prompt
+
+
+def test_unknown_member_bucket_is_not_exposed_to_models(tmp_path: Path) -> None:
+    db_path = tmp_path / "unknown-context.db"
+    init_db(db_path)
+    with get_conn(db_path) as conn:
+        _message(conn, group_id="g", wxid=None, name="", t=150, key="unknown", text="hello")
+        context = build_active_member_context(conn, "g", 100, 200)
+    assert context == ""

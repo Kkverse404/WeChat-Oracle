@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # weflow = official HTTP/SSE API; wx4py = visible WeChat UI only. The UI
     # fallback cannot recover sender identity and archives only text/link rows.
     ingest_backend: str = "weflow"
+    # The UI backend can locally OCR the sender label above each visible
+    # bubble and accept it only when it uniquely matches the current roster.
+    ui_sender_identity_enabled: bool = True
+    ui_sender_identity_min_score: float = 0.82
 
     # Direct local WeChat 4 archive synchronization. This is strictly opt-in
     # and only imports canonical groups stored in raw_group_authorizations.
@@ -274,6 +278,13 @@ class Settings(BaseSettings):
         if backend not in {"weflow", "wx4py"}:
             raise ValueError("WO_INGEST_BACKEND must be one of: weflow, wx4py")
         return backend
+
+    @field_validator("ui_sender_identity_min_score")
+    @classmethod
+    def _validate_ui_sender_identity_min_score(cls, v: float) -> float:
+        if not 0.7 <= v <= 1.0:
+            raise ValueError("WO_UI_SENDER_IDENTITY_MIN_SCORE must be between 0.7 and 1.0")
+        return v
 
     @field_validator("raw_wechat_account")
     @classmethod

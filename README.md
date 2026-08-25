@@ -115,7 +115,7 @@ The build includes the reviewed local-read implementation, but deliberately excl
 
 `wx4py` is licensed under AGPL-3.0-or-later. The build copies its license and `THIRD_PARTY_NOTICES.md` into the output. A local personal build can be tested here, but do not redistribute it until the applicable source-distribution and other license obligations have been reviewed.
 
-When using `WO_INGEST_BACKEND=weflow`, start an official functional WeFlow build and enable its HTTP API first. With `wx4py`, keep WeChat unlocked and visible; only UI-exposed text/link rows are archived, sender identity is unavailable, and downtime cannot be reconstructed completely.
+When using `WO_INGEST_BACKEND=weflow`, start an official functional WeFlow build and enable its HTTP API first. With `wx4py`, keep WeChat unlocked and visible; only UI-exposed text/link rows are archived and downtime cannot be reconstructed completely. The UI backend locally OCRs sender labels against the exact visible group roster. It stores a group-scoped synthetic identity only for a unique confident match; unresolved rows remain anonymous rather than being guessed.
 
 Before enabling sends, test one exact group without sending anything:
 
@@ -620,6 +620,8 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root. |
 | `WO_WEFLOW_TOKEN` | empty | WeFlow token. |
 | `WO_INGEST_BACKEND` | `weflow` | `weflow` or visible-UI `wx4py`. |
+| `WO_UI_SENDER_IDENTITY_ENABLED` | `True` | Locally sync the visible group roster and OCR sender labels for UI-only messages. |
+| `WO_UI_SENDER_IDENTITY_MIN_SCORE` | `0.82` | Minimum unique roster-match score; ambiguous matches remain anonymous. |
 | `WO_BOT_NAME` | empty | Bot's group nickname. Required by dispatcher. |
 | `WO_BOT_WXID` | empty | Optional bot wxid for reply-to-bot trigger. |
 | `WO_LLM_PROVIDER` | `openai-compatible` | LLM provider adapter. |
