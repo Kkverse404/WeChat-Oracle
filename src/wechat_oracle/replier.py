@@ -693,10 +693,10 @@ class UiaDirectReplier(Wx4pyReplier):
 # ---- factory --------------------------------------------------------------
 
 
-def build_replier() -> Replier:
+def build_replier(*, force_send: bool = False) -> Replier:
     """Build the configured replier. Always returns a working Replier (may
     be StdoutReplier if backend init failed)."""
-    if not settings.reply:
+    if not settings.reply and not force_send:
         logger.info("WO_REPLY=False; using stdout replier")
         return StdoutReplier()
 

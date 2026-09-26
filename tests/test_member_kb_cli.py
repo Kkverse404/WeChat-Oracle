@@ -78,6 +78,27 @@ def test_show_rejects_an_unselected_group(tmp_path: Path, monkeypatch) -> None:
     assert "Invalid value" in result.output
 
 
+def test_send_random_refuses_when_no_completed_profile(tmp_path: Path, monkeypatch) -> None:
+    _archive(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.settings, "member_kb_enabled", True)
+    monkeypatch.setattr(cli.settings, "reply_allowed_groups", ["群一"])
+    result = runner.invoke(app, ["member-kb", "send-random", "群一", "--yes"])
+    assert result.exit_code == 2
+    assert "no completed publishable member profile" in result.output
+
+
+def test_send_specific_refuses_when_profile_is_not_complete(tmp_path: Path, monkeypatch) -> None:
+    _archive(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.settings, "member_kb_enabled", True)
+    monkeypatch.setattr(cli.settings, "reply_allowed_groups", ["缇や竴"])
+    result = runner.invoke(
+        app,
+        ["member-kb", "send", "缇や竴", "wx-a", "--display-name", "Current Name", "--yes"],
+    )
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+
+
 def test_delete_requires_confirmation_and_keeps_messages(
     tmp_path: Path, monkeypatch
 ) -> None:

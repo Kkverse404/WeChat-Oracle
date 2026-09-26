@@ -96,8 +96,21 @@ class OpenAICompatLLM:
 
     name = "openai-compatible"
 
+    # Reasoning-capable OpenAI-compatible models may otherwise spend an
+    # unbounded provider default on a structured response.  Member profiles
+    # are chunked before this adapter, so a bounded JSON completion is both
+    # sufficient and important for scheduler recovery.
+    JSON_MAX_TOKENS = 8192
+    REQUEST_TIMEOUT_SECONDS = 180.0
+    CLIENT_MAX_RETRIES = 1
+
     def __init__(self, *, api_key: str, endpoint: str, json_mode: JsonMode = "native"):
-        self._client = OpenAI(api_key=api_key, base_url=endpoint)
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=endpoint,
+            timeout=self.REQUEST_TIMEOUT_SECONDS,
+            max_retries=self.CLIENT_MAX_RETRIES,
+        )
         self._json_mode = json_mode
 
     def complete_json(
@@ -115,11 +128,16 @@ class OpenAICompatLLM:
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
+            "max_tokens": self.JSON_MAX_TOKENS,
+            "reasoning_effort": "low",
         }
         if self._json_mode == "native":
             kwargs["response_format"] = {"type": "json_object"}
         resp = self._client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or "{}"
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            raise ValueError("model returned empty structured content")
+        return content
 
     def complete_text(
         self,
@@ -137,11 +155,15 @@ class OpenAICompatLLM:
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
+            "reasoning_effort": "low",
         }
         if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+            kwargs["max_tokens"] = max(int(max_tokens), self.JSON_MAX_TOKENS)
         resp = self._client.chat.completions.create(**kwargs)
-        return (resp.choices[0].message.content or "").strip()
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            raise ValueError("model returned empty text content")
+        return content.strip()
 
     def complete_with_tools(
         self,

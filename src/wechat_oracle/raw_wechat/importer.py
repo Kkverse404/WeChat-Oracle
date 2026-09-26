@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -240,6 +240,7 @@ def import_authorized_group_text_messages_many_with_cursors(
     group_name: str,
     after_local_ids: dict[str, int] | None = None,
     since_t: int | None = None,
+    message_observer: Callable[[Message], None] | None = None,
 ) -> tuple[str, int, int, dict[str, int]]:
     """Import one pre-authorized canonical chatroom across numeric shards."""
     if not message_dbs:
@@ -261,7 +262,16 @@ def import_authorized_group_text_messages_many_with_cursors(
         )
         for message_db in message_dbs
     )
-    attempted, inserted = write_messages(archive, chain.from_iterable(streams))
+    messages = chain.from_iterable(streams)
+    if message_observer is not None:
+        unobserved_messages = messages
+
+        def observed_messages() -> Iterator[Message]:
+            for message in unobserved_messages:
+                message_observer(message)
+                yield message
+        messages = observed_messages()
+    attempted, inserted = write_messages(archive, messages)
     cursors: dict[str, int] = {}
     table = message_table(group_id)
     for message_db in message_dbs:

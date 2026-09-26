@@ -86,6 +86,11 @@ Build the console-mode, Windows x64 `onedir` package on Windows:
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
+For an in-place rebuild of this machine's existing portable installation, add
+`-PreserveLocalConfig`. It temporarily safeguards and restores the existing
+`dist\WeChatOracle\.env`; ordinary release builds still reject runtime
+configuration and secrets from the output.
+
 The result is `dist\WeChatOracle\WeChatOracle.exe`. Keep and distribute the entire `dist\WeChatOracle` directory because the executable depends on its `_internal` directory. The first no-argument launch opens `setup` when `.env` is absent; later no-argument launches run the assistant. Explicit commands remain available:
 
 ```powershell
@@ -113,7 +118,9 @@ For manual setup, create `.env` in the repository root. Start with the common se
 # Local archive. Keep disabled until the in-app setup has shown the account and groups.
 WO_RAW_WECHAT_ENABLED=False
 WO_RAW_WECHAT_ACCOUNT=
-WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=60
+WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=30
+WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED=True
+WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS=300
 WO_GROUPS=[]
 
 # Bot identity in the target group
@@ -149,7 +156,7 @@ WO_AGENT_CONTINUATION_ENABLED=True
 WO_AGENT_CONTINUATION_MAX_FOLLOWUPS=2
 WO_AGENT_CONTINUATION_DELAY_SECONDS=90
 WO_AGENT_CONTINUATION_TTL_SECONDS=600
-WO_AGENT_RECENT_CONTEXT_CHAT=100
+WO_AGENT_RECENT_CONTEXT_CHAT=40
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
 
@@ -261,9 +268,44 @@ uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid-or-exac
 uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid> --messages --limit 50
 uv run wechat-oracle member-kb delete --group-id <group_id> --member <wxid> --yes
 uv run wechat-oracle member-kb rebuild --group-id <group_id> --member <wxid> --yes
+WeChatOracle.exe member-kb send-random "Exact Group Name" --yes
+WeChatOracle.exe member-kb send "Exact Group Name" <wxid-or-exact-name> --display-name "Verified Current Group Name" --yes
+WeChatOracle.exe member-kb broadcast-all "Exact Group Name" --skip-member <already-sent-wxid> --yes
+WeChatOracle.exe member-kb broadcast-status
 ```
 
-The raw-message library is the existing `messages` table; it is not duplicated. Profiles and claims are group-scoped, retain evidence message IDs, preserve superseded claims, and never merge the same wxid across groups. Press `k` in the dashboard to browse members, evidence, and original messages or to edit/lock profile sections. Enabling this feature sends selected group messages and derived profiles to the configured OpenAI-compatible API. In this installation, sensitive inferences are allowed in profiles and may be used by replies and scheduled summaries.
+`send-random` selects only a non-UNKNOWN member whose full-history bootstrap is
+complete and whose profile contains a summary or current evidence-linked claim.
+It renders `#成员画像（name）` without copying raw messages, requires exact group
+authorization plus action-time `--yes`, and uses the persistent delivery outbox;
+an uncertain send is never automatically retried. When profile JSON fails schema
+validation, the automatic retry receives bounded validation feedback with no chat
+content. Profile, evidence, and cursor writes remain atomic.
+`send` targets one exact completed member through the same authorization and
+outbox path; its optional title is only for a separately verified current group nickname.
+`broadcast-all` creates a persistent member snapshot. The running product waits
+for automatic member-KB completion and sends each eligible profile exactly once;
+restart recovery uses deterministic outbox markers, UNKNOWN is excluded, and
+profile delivery pauses around the hourly-summary grace window.
+
+One-shot real summary delivery uses the same authorization, idempotent outbox,
+and UIA sender as scheduled summaries. It is independent of `WO_REPLY` and
+requires an explicit action-time `--yes` confirmation:
+
+```powershell
+WeChatOracle.exe summary send-once "Exact Group Name" --period previous-hour --yes
+WeChatOracle.exe summary send-once "Exact Group Name" --period latest-active-hour --yes
+WeChatOracle.exe summary send-once "Exact Group Name" --start 2026-08-12T08:00 --end 2026-08-12T09:00 --yes
+```
+
+Use `--retry-failed` only when retrying a failed/skipped generation that never
+created a delivery record. A sent, unknown, or in-progress delivery is never
+reset or retried automatically. `--start` and `--end` must be supplied together;
+naive values use `WO_SUMMARY_TIMEZONE`, and the end boundary is exclusive.
+
+The raw-message library is the existing `messages` table; it is not duplicated. Profiles and claims are group-scoped, retain evidence message IDs, preserve superseded claims, and never merge the same wxid across groups. Press `k` in the dashboard to browse members, evidence, and original messages or to edit/lock profile sections. After the operator enables and saves the feature, the product automatically replays full history in the background and resumes from per-member cursors after interruption. At each clock hour it waits for the five-minute sync grace, updates only members with new messages, and schedules that work before the matching group summary. `bootstrap` remains a troubleshooting command, not a normal operating step. Enabling this feature sends selected group messages and derived profiles to the configured OpenAI-compatible API. In this installation, sensitive inferences are allowed in profiles and may be used by replies and scheduled summaries.
+
+Summary attribution is a built-in output policy. When the chat source supplies reliable display names, summaries name the relevant speakers instead of reducing them to generic “group member said” phrasing, and use a light, playful tone with restrained emoji. A generic first draft is regenerated once; if the retry still violates attribution, that period fails closed and is not delivered. Missing identities are rendered as unidentified or left unattributed; the model must never guess a name. Authorized local-database ingestion can provide identity data, while visible-UI history alone does not guarantee sender identities.
 
 Health checks:
 
@@ -421,7 +463,7 @@ Follow-ups use the same per-group dispatcher queue and serialized wx4py sender a
 The native agent has two phases:
 
 - Phase A reads recent context, may call read-only tools, and returns either a chat reply or `stay_silent`.
-- Phase B sees the Phase A trace and may update `group_memory` or `persona_drift`.
+- Phase B sees the Phase A trace and may update `group_memory` or `persona_drift`. It is disabled on interactive chat by default so a generated reply is not held behind memory writes; enable auto-lurk for background group-culture learning.
 
 Phase A initial context includes the latest `WO_AGENT_RECENT_CONTEXT_CHAT` messages from the current group. Tools can search older history, expand quote chains, expand forwarded bundles, read OCR/ASR text, read images through a vision model, read voice transcripts, or read group memory.
 
@@ -453,7 +495,7 @@ Local Ask defaults to read-only: it may read recent context, search history, ins
 - First run reads the latest `WO_AGENT_LURK_RECENT_MSGS` messages.
 - Later runs continue from `agent_lurk_state.last_msg_id`.
 - The lurk agent may call history tools to inspect older messages when the new batch points to prior context.
-- It writes only stable, reusable knowledge to `group_memory` or long-term behavior adjustments to `persona_drift`.
+- It writes only stable group culture, rules, shared topics, and reusable group-level jokes to `group_memory`, or long-term behavior adjustments to `persona_drift`. Per-member facts stay in member-kb.
 - It never calls wx4py and never sends an acknowledgement.
 
 Enable automatic lurk inside dispatcher with:
@@ -559,7 +601,9 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_RAW_WECHAT_ACCOUNT` | empty | Exact anonymous account fingerprint selected by the user. |
 | `WO_RAW_WECHAT_WORKSPACE` | `data/raw_wechat` | Git-ignored staging/state directory for stable snapshots. |
 | `WO_RAW_WECHAT_INSTALL_ROOT` | `D:\0softwear\Weixin` | Supported Weixin install root; running-process discovery is also attempted. |
-| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `60` | Continuous local archive poll interval; minimum 30 seconds. |
+| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `30` | Continuous local archive poll interval; minimum 30 seconds. |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED` | `True` | When raw sync is authorized, register only fresh inbound exact @mentions as expiring dispatcher candidates if UI capture is unavailable. |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS` | `300` | Maximum raw-message age eligible for the exact-mention fallback; 30–900 seconds. |
 | `WO_LOG_LEVEL` | `INFO` | loguru level. |
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | Python logging level for wx4py internals; set to `INFO` only when debugging UI automation. |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root. |
@@ -609,13 +653,13 @@ All runtime settings use the `WO_` prefix and can be set in `.env` or the proces
 | `WO_AGENT_CONTINUATION_DELAY_SECONDS` | `90` | Default delay before reevaluating a scheduled follow-up. |
 | `WO_AGENT_CONTINUATION_TTL_SECONDS` | `600` | Expiry window for pending follow-ups. |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | Per-group probability cooldown. |
-| `WO_AGENT_MAX_STEPS` | `8` | Native Phase A max rounds. |
+| `WO_AGENT_MAX_STEPS` | `4` | Native Phase A max rounds; bounded for interactive latency. |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B max rounds. |
-| `WO_AGENT_REFLECTION_ENABLED` | `True` | Enables chat Phase B memory reflection. |
+| `WO_AGENT_REFLECTION_ENABLED` | `False` | Enables synchronous chat Phase B reflection; keep off for reply-first operation and use lurk for background learning. |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | Persona YAML directory. |
-| `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | Initial recent-message window for agent chat. |
-| `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | Hard cap for `group_memory`. |
-| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `20` | Native Phase A tool budget. |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `40` | Initial recent-message window for agent chat. |
+| `WO_AGENT_MEMORY_MAX_CHARS` | `12000` | Compact group culture/rules/topics memory cap; member facts belong in member-kb. |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `8` | Native Phase A total tool budget. |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Native Phase A per-step tool budget. |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Native image-read budget. |
 | `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Native voice-read budget. |

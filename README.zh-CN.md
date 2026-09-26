@@ -86,6 +86,9 @@ uv run wechat-oracle run
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
+如果是在本机已有的便携目录上原地升级，可显式加 `-PreserveLocalConfig`。脚本会临时保护并在构建后恢复
+`dist\WeChatOracle\.env`；普通发布构建仍会拒绝把任何运行配置和密钥放进输出目录。
+
 产物位于 `dist\WeChatOracle\WeChatOracle.exe`。必须保留并交付整个 `dist\WeChatOracle` 目录，不能只复制 EXE，因为程序依赖同目录下的 `_internal`。未带参数首次启动且没有 `.env` 时会进入 `setup`；配置完成后，未带参数启动会直接运行助手。也可以显式执行：
 
 ```powershell
@@ -108,7 +111,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 # 本机读取默认关闭；先通过 setup 查看账号与群。
 WO_RAW_WECHAT_ENABLED=False
 WO_RAW_WECHAT_ACCOUNT=
-WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=60
+WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS=30
+WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED=True
+WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS=300
 WO_GROUPS=[]
 
 # Bot identity in the target group
@@ -142,7 +147,7 @@ WO_AGENT_CONTINUATION_ENABLED=True
 WO_AGENT_CONTINUATION_MAX_FOLLOWUPS=2
 WO_AGENT_CONTINUATION_DELAY_SECONDS=90
 WO_AGENT_CONTINUATION_TTL_SECONDS=600
-WO_AGENT_RECENT_CONTEXT_CHAT=100
+WO_AGENT_RECENT_CONTEXT_CHAT=40
 WO_LLM_MAX_TOKENS=5000
 WO_LLM_WRITE_MAX_TOKENS=10000
 
@@ -279,9 +284,36 @@ uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid或精�
 uv run wechat-oracle member-kb show --group-id <group_id> --member <wxid> --messages --limit 50
 uv run wechat-oracle member-kb delete --group-id <group_id> --member <wxid> --yes
 uv run wechat-oracle member-kb rebuild --group-id <group_id> --member <wxid> --yes
+WeChatOracle.exe member-kb send-random "精确群名" --yes
+WeChatOracle.exe member-kb send "精确群名" <wxid或精确昵称> --display-name "已核验的当前群昵称" --yes
+WeChatOracle.exe member-kb broadcast-all "精确群名" --skip-member <已发送wxid> --yes
+WeChatOracle.exe member-kb broadcast-status
 ```
 
-成员原始消息库直接使用现有 `messages` 表，不复制聊天记录。画像和结论严格按群隔离，保存证据消息 ID，并永久保留被新证据取代的旧结论；同一个 wxid 在不同群不会合并。主界面按 `k` 可查看成员、结论证据和原话，也可编辑或锁定画像栏目。启用后，所选群消息和派生画像会发送到配置的 OpenAI-compatible API；本安装允许敏感属性推断，并允许回复和定时总结使用这些画像。
+`send-random` 只从已完成全历史建档、非未知成员且包含摘要或有效结论的画像中随机选择，
+输出 `#成员画像（昵称）` 卡片；不复制原话。它要求精确群授权和当次 `--yes`，发送复用
+持久化 outbox。发送结果不确定时绝不自动重试。模型 JSON 首次校验失败时，后台会把不含
+聊天内容的具体 schema 反馈加入下一次自动重试；画像、证据与游标仍须原子提交。
+`send` 可指定一个已完整建档成员，仍复用同一授权和 outbox；可选标题只用于另行核验过的当前群昵称。
+`broadcast-all` 会创建持久化的成员快照；正常运行的产品等待成员知识库自动完成后逐人发送，
+用确定性 outbox 标记实现重启恢复和成功项不重复，排除未知成员，并在整点总结宽限窗口主动让路。
+
+一次性真实摘要发送与定时摘要复用相同的精确群授权、幂等 outbox 和 UIA
+发送器。它不要求开启 `WO_REPLY`，但每次必须显式提供操作时确认：
+
+```powershell
+WeChatOracle.exe summary send-once "精确群名" --period previous-hour --yes
+WeChatOracle.exe summary send-once "精确群名" --period latest-active-hour --yes
+WeChatOracle.exe summary send-once "精确群名" --start 2026-08-12T08:00 --end 2026-08-12T09:00 --yes
+```
+
+只有生成失败/跳过且从未创建发送记录时才可加 `--retry-failed`。已发送、结果未知
+或正在发送的任务永远不会被这个命令重置或自动重试。`--start/--end` 必须成对提供，
+无时区时按 `WO_SUMMARY_TIMEZONE` 解释，结束时间为不包含边界。
+
+成员原始消息库直接使用现有 `messages` 表，不复制聊天记录。画像和结论严格按群隔离，保存证据消息 ID，并永久保留被新证据取代的旧结论；同一个 wxid 在不同群不会合并。主界面按 `k` 可查看成员、结论证据和原话，也可编辑或锁定画像栏目。启用并保存后，产品自动在后台完整回放历史，中断后按逐成员游标续跑；以后每个整点等待 5 分钟同步宽限，只更新上一小时有新发言的成员，并先于同周期摘要调度。无需人工调用 `bootstrap`，CLI 仅用于排障。启用后，所选群消息和派生画像会发送到配置的 OpenAI-compatible API；本安装允许敏感属性推断，并允许回复和定时总结使用这些画像。
+
+摘要默认保留聊天源提供的昵称：涉及具体发言、观点、决定或待办时直接写昵称，不把已知人物泛化成“群友说”；多人话题尽量分别交代主要参与者。整体表达轻松、略带俏皮感，可使用贴切 emoji，但不能为了玩梗歪曲事实。若已有可靠昵称但首版摘要仍使用泛化人物称呼，产品会自动重生成一次；重试仍不合格则本期失败且不发送。如果聊天源没有提供可靠昵称/成员 ID，只能标为“未识别成员”或省略归因，绝不猜人名。本机原库读取在用户明确授权后可以补齐这类身份信息；可见 UI 回填本身不保证拥有发送者身份。
 
 健康检查：
 
@@ -406,7 +438,7 @@ follow-up 仍走按群串行的 dispatcher 队列和串行 wx4py sender，并受
 native agent 分两阶段：
 
 - Phase A 读取最近上下文，可调用只读工具，最后返回群聊回复或 `stay_silent`。
-- Phase B 读取 Phase A trace，可更新 `group_memory` 或 `persona_drift`。
+- Phase B 读取 Phase A trace，可更新 `group_memory` 或 `persona_drift`。交互聊天默认关闭同步 Phase B，避免正文已经生成后仍被记忆写入阻塞；群文化改由 auto-lurk 后台学习。
 
 Phase A 初始上下文包含当前群最近 `WO_AGENT_RECENT_CONTEXT_CHAT` 条消息。工具可以搜索更早历史、展开引用链、展开合并转发、读取 OCR/ASR 文本、通过视觉模型读图、读取语音转写，或读取群记忆。
 
@@ -438,7 +470,7 @@ Local Ask 默认只读：可以读取最近上下文、搜索历史、查看媒�
 - 首次运行读取最近 `WO_AGENT_LURK_RECENT_MSGS` 条消息。
 - 后续运行从 `agent_lurk_state.last_msg_id` 继续。
 - lurk agent 可以在新批次指向旧上下文时调用历史工具查看老消息。
-- 它只把稳定、可复用的信息写入 `group_memory`，或把长期行为调整写入 `persona_drift`。
+- 它只把稳定的群文化、规则、共同话题和群级梗写入 `group_memory`，或把长期行为调整写入 `persona_drift`；成员个人事实留在 member-kb。
 - 它不会调用 wx4py，也不会发送收到提示。
 
 在 dispatcher 中启用自动 lurk：
@@ -541,7 +573,9 @@ transcript 状态：
 | `WO_RAW_WECHAT_ACCOUNT` | empty | 用户选择的精确匿名账号指纹。 |
 | `WO_RAW_WECHAT_WORKSPACE` | `data/raw_wechat` | 稳定快照与同步状态的 gitignore 目录。 |
 | `WO_RAW_WECHAT_INSTALL_ROOT` | `D:\0softwear\Weixin` | 支持的微信安装目录；也会尝试从运行进程发现。 |
-| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `60` | 本机数据库监控间隔，最小 30 秒。 |
+| `WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS` | `30` | 本机数据库监控间隔，最小 30 秒。 |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED` | `True` | 已授权 raw 同步时，若 UI 采集不可用，仅将新鲜、来自他人且明确 @ 机器人的消息登记为限时回复候选。 |
+| `WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS` | `300` | raw 精确 @ 回退允许的最大消息年龄，范围 30–900 秒。 |
 | `WO_LOG_LEVEL` | `INFO` | loguru level。 |
 | `WO_WX4PY_LOG_LEVEL` | `WARNING` | wx4py 内部 Python logging 级别；只有排查 UI 自动化时才建议设为 `INFO`。 |
 | `WO_WEFLOW_BASE_URL` | `http://127.0.0.1:5031` | WeFlow HTTP API root。 |
@@ -590,13 +624,13 @@ transcript 状态：
 | `WO_AGENT_CONTINUATION_DELAY_SECONDS` | `90` | 重新评估 follow-up 的默认延迟。 |
 | `WO_AGENT_CONTINUATION_TTL_SECONDS` | `600` | pending follow-up 的过期时间。 |
 | `WO_AGENT_COOLDOWN_SECONDS` | `30` | 每群 probability cooldown。 |
-| `WO_AGENT_MAX_STEPS` | `8` | Native Phase A 最大轮数。 |
+| `WO_AGENT_MAX_STEPS` | `4` | Native Phase A 最大轮数；为交互回复延迟设置硬上限。 |
 | `WO_AGENT_REFLECT_MAX_STEPS` | `3` | Native Phase B 最大轮数。 |
-| `WO_AGENT_REFLECTION_ENABLED` | `True` | 启用 chat Phase B 记忆反思。 |
+| `WO_AGENT_REFLECTION_ENABLED` | `False` | 启用同步 chat Phase B；回复优先模式应保持关闭，改由 lurk 后台学习。 |
 | `WO_AGENT_PERSONAS_DIR` | `data/personas` | Persona YAML 目录。 |
-| `WO_AGENT_RECENT_CONTEXT_CHAT` | `100` | agent chat 初始最近消息窗口。 |
-| `WO_AGENT_MEMORY_MAX_CHARS` | `100000` | `group_memory` 硬字符上限。 |
-| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `20` | Native Phase A tool 总预算。 |
+| `WO_AGENT_RECENT_CONTEXT_CHAT` | `40` | agent chat 初始最近消息窗口。 |
+| `WO_AGENT_MEMORY_MAX_CHARS` | `12000` | 紧凑群文化/规则/共同话题记忆上限；成员事实进入 member-kb。 |
+| `WO_AGENT_MAX_TOOL_CALLS_PER_RUN` | `8` | Native Phase A tool 总预算。 |
 | `WO_AGENT_MAX_TOOL_CALLS_PER_STEP` | `4` | Native Phase A 单 step tool 预算。 |
 | `WO_AGENT_MAX_IMAGE_READS_PER_RUN` | `2` | Native 读图预算。 |
 | `WO_AGENT_MAX_VOICE_READS_PER_RUN` | `2` | Native 读语音预算。 |

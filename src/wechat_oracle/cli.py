@@ -45,6 +45,7 @@ agent_app = typer.Typer(no_args_is_help=True, help="Inspect & manage agent memor
 openclaw_app = typer.Typer(no_args_is_help=True, help="OpenClaw runtime backend (the recommended agent path; uses subscription instead of per-token API).")
 raw_app = typer.Typer(no_args_is_help=True, help="Authorized read-only local WeChat database synchronization.")
 member_kb_app = typer.Typer(no_args_is_help=True, help="Inspect and maintain evidence-linked per-member knowledge.")
+summary_app = typer.Typer(no_args_is_help=True, help="Preview and send audited one-shot group summaries.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(weflow_app, name="weflow")
 app.add_typer(worker_app, name="worker")
@@ -53,6 +54,223 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(openclaw_app, name="openclaw")
 app.add_typer(raw_app, name="raw")
 app.add_typer(member_kb_app, name="member-kb")
+app.add_typer(summary_app, name="summary")
+
+
+def _resolve_summary_send_group(conn, selector: str) -> tuple[str, str]:
+    from .daily_summary import resolve_summary_groups
+
+    selector = selector.strip()
+    matches = [
+        item for item in resolve_summary_groups(conn)
+        if selector in {item[0], item[1]}
+    ]
+    if not matches:
+        raise typer.BadParameter(
+            "group must exactly match a currently selected and send-authorized group id or name"
+        )
+    if len(matches) != 1:
+        raise typer.BadParameter("group selector is ambiguous; use the exact canonical group id")
+    return matches[0]
+
+
+def _explicit_summary_period(start_text: str, end_text: str) -> "SummaryPeriod":
+    """Parse an action-time confirmed ISO range in the configured timezone."""
+    from .time_ranges import SummaryPeriod
+
+    if not start_text.strip() or not end_text.strip():
+        raise ValueError("--start and --end must be provided together")
+
+    def parse(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.strip())
+        except ValueError as exc:
+            raise ValueError("--start/--end must be ISO date-times") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=settings.summary_tz)
+        else:
+            parsed = parsed.astimezone(settings.summary_tz)
+        return parsed
+
+    start = parse(start_text)
+    end = parse(end_text)
+    start_t, end_t = int(start.timestamp()), int(end.timestamp())
+    if end_t <= start_t:
+        raise ValueError("--end must be later than --start")
+    if end_t > int(time.time()):
+        raise ValueError("--end must not be in the future")
+    kind = "hourly" if end_t - start_t == 3600 and start.minute == end.minute == 0 else "manual"
+    return SummaryPeriod(
+        kind,
+        start_t,
+        end_t,
+        f"{start:%Y-%m-%d %H:%M%z} - {end:%Y-%m-%d %H:%M%z}",
+    )
+
+
+@summary_app.command("send-once")
+def summary_send_once(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    period_kind: str = typer.Option(
+        "previous-hour",
+        "--period",
+        help="previous-hour, latest-active-hour, or previous-day",
+    ),
+    start: str = typer.Option("", "--start", help="Explicit ISO start in summary timezone"),
+    end: str = typer.Option("", "--end", help="Explicit ISO end (exclusive)"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat summary delivery"),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Explicitly retry a failed/skipped generation that has no delivery record",
+    ),
+) -> None:
+    """Generate and send one idempotent summary through the configured UI sender."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    from .daily_summary import (
+        latest_active_hour,
+        reset_failed_summary_period,
+        resolve_summary_groups,
+        run_summary_group,
+    )
+    from .llm import build_llm_client
+    from .replier import build_replier
+    from .time_ranges import SummaryPeriod, latest_mature_summary_periods
+
+    normalized = period_kind.strip().lower()
+    if normalized not in {"previous-hour", "latest-active-hour", "previous-day"}:
+        raise typer.BadParameter(
+            "--period must be previous-hour, latest-active-hour, or previous-day"
+        )
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        if bool(start.strip()) != bool(end.strip()):
+            raise typer.BadParameter("--start and --end must be provided together")
+        if start.strip() and end.strip():
+            try:
+                period = _explicit_summary_period(start, end)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            min_messages = settings.hourly_summary_min_messages
+        elif normalized == "latest-active-hour":
+            period = latest_active_hour(
+                conn,
+                group_id=group_id,
+                min_messages=settings.hourly_summary_min_messages,
+            )
+            if period is None:
+                raise typer.BadParameter("no completed active hour has enough messages")
+            min_messages = settings.hourly_summary_min_messages
+        else:
+            periods = latest_mature_summary_periods(
+                tz=settings.summary_tz,
+                grace_seconds=settings.summary_sync_grace_seconds,
+                hourly=normalized == "previous-hour",
+                daily=normalized == "previous-day",
+            )
+            period = periods[0]
+            min_messages = (
+                settings.hourly_summary_min_messages
+                if period.kind == "hourly"
+                else settings.daily_summary_min_messages
+            )
+        if retry_failed:
+            reset_failed_summary_period(conn, group_id=group_id, period=period)
+        llm = build_llm_client(
+            provider=settings.llm_provider,
+            api_key=settings.llm_api_key,
+            endpoint=settings.llm_endpoint,
+            json_mode=settings.llm_json_mode,
+        )
+        replier = build_replier(force_send=True)
+        result = run_summary_group(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            period=period,
+            min_messages=min_messages,
+            replier=replier,
+            llm=llm,
+            require_current_authorization=True,
+        )
+        row = conn.execute(
+            """
+            SELECT run_id,status,message_count,LENGTH(summary_text) AS summary_chars,result
+              FROM summary_runs
+             WHERE group_id=? AND period_start=? AND period_end=? AND trigger_kind=?
+            """,
+            (group_id, period.start_t, period.end_t, period.kind),
+        ).fetchone()
+    payload = {
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "period": period.label,
+        "run": dict(row) if row is not None else None,
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
+
+
+@member_kb_app.command("send")
+def member_kb_send(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    member: str = typer.Argument(..., help="Exact member id, stored name, or known alias"),
+    display_name: str = typer.Option("", "--display-name", help="Verified current group nickname for the card title"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat profile-card delivery"),
+) -> None:
+    """Send one specified completed, evidence-linked member profile card."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    title = display_name.strip()
+    if title and (len(title) > 80 or "\n" in title or "\r" in title):
+        raise typer.BadParameter("display name must be a single line of at most 80 characters")
+    from .daily_summary import deliver_manual_text
+    from .member_knowledge import get_member_profile, render_member_profile_card
+    from .replier import build_replier
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        sender_wxid = _resolve_member_selector(conn, group_id, member)
+        state = conn.execute(
+            "SELECT full_history_complete FROM member_update_state WHERE group_id=? AND sender_wxid=?",
+            (group_id, sender_wxid),
+        ).fetchone()
+        profile = get_member_profile(conn, group_id, sender_wxid)
+        if (
+            profile is None
+            or state is None
+            or not bool(state["full_history_complete"])
+            or not (str(profile.get("summary_text") or "").strip() or profile.get("claims"))
+        ):
+            raise typer.BadParameter("the selected member has no completed publishable profile")
+        if title:
+            profile = dict(profile)
+            profile["display_name"] = title
+        card = render_member_profile_card(profile)
+        result = deliver_manual_text(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            text=card,
+            replier=build_replier(force_send=True),
+            require_current_authorization=True,
+        )
+    typer.echo(json.dumps({
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "member": profile.get("display_name") or profile.get("sender_wxid"),
+        "profile_version": profile.get("version"),
+    }, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
 
 
 def _run_raw_command(command: str, *args: str) -> None:
@@ -307,6 +525,47 @@ def member_kb_show(
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+@member_kb_app.command("send-random")
+def member_kb_send_random(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm one real WeChat profile-card delivery"),
+) -> None:
+    """Randomly send one completed, evidence-linked member profile card."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm one real WeChat delivery")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    from .daily_summary import deliver_manual_text
+    from .member_knowledge import render_member_profile_card, select_random_completed_profile
+    from .replier import build_replier
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        profile = select_random_completed_profile(conn, group_id)
+        if profile is None:
+            raise typer.BadParameter("no completed publishable member profile is available")
+        card = render_member_profile_card(profile)
+        replier = build_replier(force_send=True)
+        result = deliver_manual_text(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            text=card,
+            replier=replier,
+            require_current_authorization=True,
+        )
+    typer.echo(json.dumps({
+        "delivery": result,
+        "group_id": group_id,
+        "group_name": group_name,
+        "member": profile.get("display_name") or profile.get("sender_wxid"),
+        "profile_version": profile.get("version"),
+    }, ensure_ascii=False))
+    if result != "sent":
+        raise typer.Exit(1)
+
+
 @member_kb_app.command("delete")
 def member_kb_delete(
     group_id: str = typer.Option(..., "--group-id"),
@@ -324,6 +583,42 @@ def member_kb_delete(
         sender_wxid = _resolve_member_selector(conn, group_id, member)
         delete_member_profile(conn, group_id, sender_wxid, keep_messages=True)
     typer.echo("derived profile deleted; raw messages retained")
+
+
+@member_kb_app.command("broadcast-all")
+def member_kb_broadcast_all(
+    group: str = typer.Argument(..., help="Exact selected group id or display name"),
+    skip_member: list[str] = typer.Option([], "--skip-member", help="Exact member id already delivered; repeatable"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the persistent all-member delivery campaign"),
+) -> None:
+    """Queue a restart-safe campaign; the running product builds and sends automatically."""
+    if not yes:
+        raise typer.BadParameter("pass --yes to confirm multiple real WeChat deliveries")
+    if not settings.member_kb_enabled:
+        raise typer.BadParameter("member knowledge is disabled")
+    from .member_broadcast import create_or_resume_broadcast
+
+    init_db()
+    with get_conn() as conn:
+        group_id, group_name = _resolve_summary_send_group(conn, group)
+        status = create_or_resume_broadcast(
+            conn,
+            group_id=group_id,
+            group_name=group_name,
+            skip_members=skip_member,
+        )
+    typer.echo(json.dumps(status, ensure_ascii=False))
+
+
+@member_kb_app.command("broadcast-status")
+def member_kb_broadcast_status() -> None:
+    """Show sanitized progress for the latest all-member delivery campaign."""
+    from .member_broadcast import broadcast_status
+
+    init_db()
+    with get_conn() as conn:
+        status = broadcast_status(conn)
+    typer.echo(json.dumps(status, ensure_ascii=False))
 
 
 @member_kb_app.command("rebuild")
@@ -470,7 +765,11 @@ def setup(
         "WO_AGENT_BACKEND": backend,
         "WO_AGENT_BASE_PROBABILITY": str(settings.agent_base_probability),
         "WO_AGENT_PROACTIVE_MODE": settings.agent_proactive_mode,
+        "WO_AGENT_MAX_STEPS": str(settings.agent_max_steps),
+        "WO_AGENT_REFLECTION_ENABLED": _env_bool(settings.agent_reflection_enabled),
         "WO_AGENT_RECENT_CONTEXT_CHAT": str(settings.agent_recent_context_chat),
+        "WO_AGENT_MEMORY_MAX_CHARS": str(settings.agent_memory_max_chars),
+        "WO_AGENT_MAX_TOOL_CALLS_PER_RUN": str(settings.agent_max_tool_calls_per_run),
         "WO_LLM_MAX_TOKENS": str(settings.llm_max_tokens),
         "WO_LLM_WRITE_MAX_TOKENS": str(settings.llm_write_max_tokens or ""),
         "WO_AGENT_LURK_ENABLED": _env_bool(settings.agent_lurk_enabled),
@@ -479,6 +778,12 @@ def setup(
         "WO_RAW_WECHAT_ENABLED": _env_bool(use_local_db),
         "WO_RAW_WECHAT_ACCOUNT": "",
         "WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS": str(settings.raw_wechat_sync_interval_seconds),
+        "WO_RAW_WECHAT_REPLY_FALLBACK_ENABLED": _env_bool(
+            settings.raw_wechat_reply_fallback_enabled
+        ),
+        "WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS": str(
+            settings.raw_wechat_reply_fallback_max_age_seconds
+        ),
         "WO_HOURLY_SUMMARY_ENABLED": _env_bool(hourly_summary),
         "WO_DAILY_SUMMARY_ENABLED": _env_bool(daily_summary),
         "WO_SUMMARY_SYNC_GRACE_SECONDS": str(settings.summary_sync_grace_seconds),

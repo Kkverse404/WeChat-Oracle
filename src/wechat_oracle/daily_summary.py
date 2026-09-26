@@ -25,7 +25,32 @@ from .time_ranges import (
 SUMMARY_HEADERS = {
     "hourly": "#过去一小时话题",
     "daily": "#过去一天话题",
+    "manual": "",
 }
+
+_UNKNOWN_SENDER_LABELS = {"", "?", "群友", "未知成员", "未识别成员", "__unknown__"}
+_GENERIC_SPEAKER_PHRASES = ("群友说", "有群友", "某位群友", "有人说", "有人提到")
+
+
+def _known_summary_senders(candidates: list[object]) -> tuple[str, ...]:
+    """Return stable, trustworthy display labels present in this period."""
+    names: list[str] = []
+    for candidate in candidates:
+        sender = str(getattr(candidate, "sender", "") or "").strip()
+        if sender in _UNKNOWN_SENDER_LABELS or sender in names:
+            continue
+        names.append(sender)
+    return tuple(names)
+
+
+def _summary_attribution_valid(summary: str, candidates: list[object]) -> bool:
+    """Reject generic attribution only when the source supplied real names."""
+    names = _known_summary_senders(candidates)
+    if not names:
+        return True
+    if not any(name in summary for name in names):
+        return False
+    return not any(phrase in summary for phrase in _GENERIC_SPEAKER_PHRASES)
 
 
 def _build_summary_member_context(
@@ -226,7 +251,9 @@ def run_summary_group(
         detail_request = (
             f"{period.label} 自动群聊总结。请按实际话题分段，尽量详细地写清人物观点、"
             "事情经过、结论、分歧和待办；每个话题可用一个贴切 emoji 开头。"
-            "不要添加总标题，不要使用 @，不要编造原文没有的信息。"
+            "每个话题优先采用「昵称 + 具体发言/行动」的写法；只要候选消息给出了昵称，"
+            "就不能泛化成‘群友说’‘有人说’。表达可以俏皮一点，让人愿意读完，"
+            "但不要添加总标题，不要使用 @，不要编造原文没有的信息。"
         )
         detail_request += (
             "\n[Summary grounding] The raw chat messages in the requested period are the event source and take precedence."
@@ -244,6 +271,23 @@ def run_summary_group(
         ).strip()
         if not summary:
             raise RuntimeError("summary model returned empty text")
+        if not _summary_attribution_valid(summary, candidates):
+            allowed_names = "、".join(_known_summary_senders(candidates))
+            correction = (
+                detail_request
+                + "\n\n上一版没有遵守人物归因规则。请从原始候选消息重新生成一次："
+                + f"本期可用昵称为「{allowed_names}」；涉及具体人物时必须直接写这些昵称，"
+                + "禁止使用‘群友说’‘有群友’‘有人说’代替。"
+            )
+            summary = summarize_chat_hierarchical(
+                llm,
+                settings.llm_model,
+                candidates,
+                correction,
+                settings.data_dir / "llm_debug.log",
+            ).strip()
+            if not summary or not _summary_attribution_valid(summary, candidates):
+                raise RuntimeError("summary attribution policy was not satisfied")
         summary = summary.replace("@", "＠")
         if not _finish_generation(
             conn,
@@ -305,6 +349,156 @@ def run_daily_group(
         replier=replier,
         llm=llm,
         sleep=sleep,
+    )
+
+
+def latest_active_hour(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    min_messages: int,
+    now: datetime | None = None,
+    max_buckets: int = 2000,
+) -> SummaryPeriod | None:
+    """Return the newest completed hour with enough effective group messages."""
+    from .dispatcher import fetch_candidates
+
+    mature = latest_mature_summary_periods(
+        now=now,
+        tz=settings.summary_tz,
+        grace_seconds=settings.summary_sync_grace_seconds,
+        hourly=True,
+    )[0]
+    rows = conn.execute(
+        """
+        SELECT DISTINCT CAST(m.t / 3600 AS INTEGER) * 3600 AS hour_start
+          FROM messages m
+          LEFT JOIN group_aliases ga ON ga.alias_id=m.group_id
+         WHERE COALESCE(ga.canonical_group_id,m.group_id)=?
+           AND m.t < ?
+         ORDER BY hour_start DESC
+         LIMIT ?
+        """,
+        (group_id, mature.end_t, max(1, int(max_buckets))),
+    ).fetchall()
+    for row in rows:
+        start_t = int(row["hour_start"])
+        end_t = start_t + 3600
+        candidates = fetch_candidates(
+            conn,
+            group_id=group_id,
+            target=None,
+            since_t=start_t,
+            until_t=end_t,
+            limit=None,
+            bot_name=settings.bot_name,
+        )
+        if len(candidates) < min_messages:
+            continue
+        start = datetime.fromtimestamp(start_t, settings.summary_tz)
+        end = datetime.fromtimestamp(end_t, settings.summary_tz)
+        return SummaryPeriod(
+            "hourly",
+            start_t,
+            end_t,
+            f"{start:%Y-%m-%d %H:%M%z} - {end:%Y-%m-%d %H:%M%z}",
+        )
+    return None
+
+
+def reset_failed_summary_period(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    period: SummaryPeriod,
+) -> bool:
+    """Explicitly reclaim a failed/skipped unsent run for a manual retry."""
+    with transaction(conn):
+        row = conn.execute(
+            """
+            SELECT run_id,status FROM summary_runs
+             WHERE group_id=? AND period_start=? AND period_end=? AND trigger_kind=?
+            """,
+            (group_id, period.start_t, period.end_t, period.kind),
+        ).fetchone()
+        if row is None:
+            return False
+        if str(row["status"]) not in {"failed", "skipped"}:
+            raise ValueError("only failed or skipped unsent summaries can be retried")
+        outbox = conn.execute(
+            "SELECT 1 FROM delivery_outbox WHERE summary_run_id=?",
+            (int(row["run_id"]),),
+        ).fetchone()
+        if outbox is not None:
+            raise ValueError("summary has a delivery record and cannot be reset")
+        conn.execute(
+            """
+            UPDATE summary_runs
+               SET status='running', lease_token=NULL, lease_until=0,
+                   finished_at=NULL, updated_at=?,
+                   result='explicit manual retry requested'
+             WHERE run_id=?
+            """,
+            (time.time(), int(row["run_id"])),
+        )
+    return True
+
+
+def deliver_manual_text(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    group_name: str,
+    text: str,
+    replier: Replier,
+    require_current_authorization: bool = True,
+    sleep: Callable[[float], None] = time.sleep,
+    delivery_marker: int | None = None,
+) -> str:
+    """Persist and deliver one confirmed non-summary card through the safe outbox."""
+    body = str(text or "").strip()
+    if not body:
+        raise ValueError("manual delivery text is empty")
+    if require_current_authorization and not _delivery_authorized(
+        conn, group_id=group_id, group_name=group_name
+    ):
+        return "unauthorized"
+    now = time.time()
+    marker = int(delivery_marker) if delivery_marker is not None else int(time.time_ns())
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO summary_runs
+                (group_id,group_name,period_start,period_end,trigger_kind,status,
+                 message_count,summary_text,result,started_at,finished_at,
+                 generation_attempt_count,updated_at)
+            VALUES (?,?,?,?, 'manual','ready',0,?,'manual card ready',?,?,1,?)
+            """,
+            (group_id, group_name, marker, marker + 1, body, now, now, now),
+        )
+        if cur.rowcount:
+            run_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO delivery_outbox(summary_run_id,status,created_at,updated_at)
+                VALUES (?,'pending',?,?)
+                """,
+                (run_id, now, now),
+            )
+        else:
+            row = conn.execute(
+                "SELECT run_id FROM summary_runs WHERE group_id=? AND period_start=? AND period_end=? AND trigger_kind='manual'",
+                (group_id, marker, marker + 1),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("manual delivery marker collision")
+            run_id = int(row["run_id"])
+    return _deliver_run(
+        conn,
+        run_id=run_id,
+        replier=replier,
+        sleep=sleep,
+        require_current_authorization=require_current_authorization,
     )
 
 
@@ -495,7 +689,7 @@ def _deliver_run(
             return "duplicate"
 
     header = SUMMARY_HEADERS.get(str(run["trigger_kind"]), "#群聊话题")
-    body = f"{header}\n\n{run['summary_text']}"
+    body = f"{header}\n\n{run['summary_text']}" if header else str(run["summary_text"])
     parts = split_message(body, settings.daily_summary_chunk_chars)
     try:
         for index, part in enumerate(parts):

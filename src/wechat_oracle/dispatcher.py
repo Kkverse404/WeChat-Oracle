@@ -2039,7 +2039,7 @@ def _next_unprocessed(
     bot_wxid: str | None = None,
     batch: int = 20,
 ) -> list[sqlite3.Row]:
-    """Oldest `batch` live messages with no command_runs row yet, globally.
+    """Oldest `batch` live/fresh-fallback messages without a run, globally.
 
     `_GlobalScheduler` serializes processing per group while allowing
     different groups to run in parallel. `_GlobalScheduler.submit` claims rows
@@ -2056,7 +2056,7 @@ def _next_unprocessed(
     can drift if you rename the bot in-group).
     """
     own_wxid_clause = ""
-    params: list[object] = [bot_name]
+    params: list[object] = [time.time(), bot_name]
     if bot_wxid:
         own_wxid_clause = "AND (m.sender_wxid IS NULL OR m.sender_wxid != ?)"
         params.append(bot_wxid)
@@ -2068,7 +2068,8 @@ def _next_unprocessed(
                m.quote_text, m.reply_to_wx_msg_id, m.wx_msg_id
           FROM messages m
      LEFT JOIN command_runs r ON r.msg_id = m.msg_id
-         WHERE m.source = 'live'
+     LEFT JOIN raw_reply_candidates rc ON rc.msg_id = m.msg_id
+         WHERE (m.source = 'live' OR rc.expires_at >= ?)
            AND m.type != 'system'
            AND r.msg_id IS NULL
            AND (m.sender_display IS NULL OR m.sender_display != ?)
@@ -2768,6 +2769,7 @@ class _GlobalScheduler:
         with get_conn() as conn:
             if not _claim(conn, msg_id):
                 return False
+            row_dict["_queued_at"] = time.time()
             append_event("dispatcher.claim", **_row_event_fields(row_dict))
 
         next_row: dict[str, object] | None = None
@@ -2797,6 +2799,7 @@ class _GlobalScheduler:
                 return False
             work = dict(claimed)
             work["_work_type"] = "followup"
+            work["_queued_at"] = time.time()
             append_event(
                 "continuation.claim",
                 job_id=job_id,
@@ -2874,6 +2877,18 @@ class _GlobalScheduler:
     def _handle(self, group_key: str, row: dict[str, object]) -> None:
         work_type = row.get("_work_type") or "message"
         msg_id = int(row["msg_id"]) if "msg_id" in row else -int(row["job_id"])
+        queued_at = float(row.get("_queued_at") or time.time())
+        event_fields: dict[str, object] = {
+            "group_id": row.get("group_id"),
+            "group_name": row.get("group_name"),
+            "work_type": work_type,
+            "queue_wait_ms": round((time.time() - queued_at) * 1000, 3),
+        }
+        if work_type == "followup":
+            event_fields["job_id"] = int(row["job_id"])
+        else:
+            event_fields["msg_id"] = msg_id
+        append_event("dispatcher.start", **event_fields)
         try:
             try:
                 with get_conn() as conn:
@@ -3098,7 +3113,9 @@ def run_dispatcher() -> None:
         summary_scheduler = None
         next_summary_check = 0.0
         member_kb_scheduler = None
+        member_broadcast_scheduler = None
         next_member_kb_check = 0.0
+        next_member_broadcast_check = 0.0
         member_kb_summary_wait_started: float | None = None
         if settings.member_kb_enabled:
             from .member_knowledge import MemberKnowledgeScheduler
@@ -3114,9 +3131,19 @@ def run_dispatcher() -> None:
                 "member knowledge enabled: archived group text and derived profiles are sent to the configured model API; "
                 "sensitive inferences may be used in replies and summaries"
             )
+            from .member_broadcast import MemberProfileBroadcastScheduler
+            member_broadcast_scheduler = MemberProfileBroadcastScheduler(
+                db_path=settings.db_path,
+                replier=replier,
+            )
         if settings.hourly_summary_enabled or settings.daily_summary_enabled:
             from .daily_summary import SummaryScheduler
             summary_scheduler = SummaryScheduler(replier=replier, llm_factory=_build_llm_client)
+            # The first loop after a restart must run the idempotent summary
+            # recovery/due check immediately.  Otherwise a freshly submitted
+            # member bootstrap can postpone an already-mature hour by another
+            # full five-minute head-start window.
+            member_kb_summary_wait_started = time.time() - 300
             logger.info(
                 "automatic summaries enabled: hourly={} daily={} timezone={} grace={}s",
                 settings.hourly_summary_enabled,
@@ -3143,7 +3170,8 @@ def run_dispatcher() -> None:
                         )
                         submitted_members = int(member_result.get("submitted", 0))
                         if submitted_members:
-                            member_kb_summary_wait_started = now_ts
+                            if member_kb_summary_wait_started is None:
+                                member_kb_summary_wait_started = now_ts
                             logger.info(
                                 "member knowledge scheduler submitted {} member job(s)",
                                 submitted_members,
@@ -3175,6 +3203,12 @@ def run_dispatcher() -> None:
                         member_kb_summary_wait_started = None
                     else:
                         next_summary_check = now_ts + 5
+                if (
+                    member_broadcast_scheduler is not None
+                    and now_ts >= next_member_broadcast_check
+                ):
+                    member_broadcast_scheduler.maybe_submit(now_ts)
+                    next_member_broadcast_check = now_ts + 10
                 rows = _next_unprocessed(
                     conn,
                     settings.bot_name,
@@ -3229,6 +3263,8 @@ def run_dispatcher() -> None:
                 summary_scheduler.close()
             if member_kb_scheduler is not None:
                 member_kb_scheduler.close()
+            if member_broadcast_scheduler is not None:
+                member_broadcast_scheduler.close()
             scheduler.close()
             if lurk_scheduler is not None:
                 lurk_scheduler.close()

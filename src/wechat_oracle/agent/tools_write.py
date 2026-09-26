@@ -3,9 +3,8 @@ replace-on-write semantics.
 
 Two writers, both replace-on-write per group:
   - update_persona_drift(drift_text)  — bot's own behavior supplement
-  - update_group_memory(notes_text)   — single freeform doc covering members,
-                                        events, and group culture; bounded
-                                        by WO_AGENT_MEMORY_MAX_CHARS
+  - update_group_memory(notes_text)   — compact group-culture document;
+                                        member facts live in member-kb
 
 Why one blob instead of per-member rows: per-id modeling adds structure the
 agent doesn't actually need. A single freeform document the agent organizes
@@ -113,9 +112,10 @@ _UPDATE_GROUP_MEMORY_SPEC = ToolSpec(
         "Replace this group's memory document with a new freeform text. "
         "Read first via read_group_memory, merge with what you've just "
         "learned, and write back the full new version. Organize the "
-        "document however you want internally — facts about members, group "
-        "events, recurring topics, all in one. No need to use any specific "
-        "format; you'll re-read your own structure later. Hard cap on size "
+        "document around group culture, durable rules, recurring shared "
+        "topics, group-level relationships, and reusable running jokes. "
+        "Do not duplicate per-member facts or profiles here; those belong in "
+        "the member knowledge base. Hard cap on size "
         "(see error message); when full, COMPACT older / less relevant "
         "material before adding new."
     ),

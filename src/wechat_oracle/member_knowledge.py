@@ -446,6 +446,66 @@ def get_member_profile(
     return _profile_output(row, conn)
 
 
+def select_random_completed_profile(
+    conn: sqlite3.Connection, group_id: str
+) -> dict[str, Any] | None:
+    """Choose one publishable completed profile, excluding UNKNOWN/placeholders."""
+    _ensure_schema(conn)
+    row = conn.execute(
+        """
+        SELECT p.*
+          FROM member_profiles p
+          JOIN member_update_state s
+            ON s.group_id=p.group_id AND s.sender_wxid=p.sender_wxid
+         WHERE p.group_id=? AND p.deleted_at IS NULL
+           AND p.sender_wxid<>? AND s.full_history_complete=1
+           AND (
+                TRIM(COALESCE(p.summary_text,''))<>''
+                OR EXISTS (
+                    SELECT 1 FROM member_claims c
+                     WHERE c.group_id=p.group_id
+                       AND c.sender_wxid=p.sender_wxid
+                       AND c.status='current'
+                )
+           )
+         ORDER BY RANDOM()
+         LIMIT 1
+        """,
+        (group_id, UNKNOWN_MEMBER_ID),
+    ).fetchone()
+    return _profile_output(row, conn) if row is not None else None
+
+
+def render_member_profile_card(profile: Mapping[str, Any], *, max_claims: int = 6) -> str:
+    """Render derived knowledge only; raw evidence text is never copied into chat."""
+    name = str(profile.get("display_name") or profile.get("sender_wxid") or "未识别成员").strip()
+    lines = [f"#成员画像（{name}）"]
+    summary = str(profile.get("summary_text") or "").strip()
+    if summary:
+        lines.extend(["", "🪪 一句话画像", summary])
+    basis_labels = {
+        "self_reported": "本人自述",
+        "observed": "聊天观察",
+        "inferred": "模型推断",
+    }
+    claims = [
+        item for item in (profile.get("claims") or [])
+        if isinstance(item, Mapping) and item.get("status") == "current"
+    ]
+    claims.sort(key=lambda item: (-float(item.get("confidence") or 0), int(item.get("claim_id") or 0)))
+    if claims:
+        lines.extend(["", "🔎 有据可查"])
+        for claim in claims[: max(1, int(max_claims))]:
+            label = basis_labels.get(str(claim.get("basis") or ""), "来源未知")
+            confidence = round(float(claim.get("confidence") or 0) * 100)
+            sensitive = " · 敏感推断" if bool(claim.get("sensitive")) else ""
+            text = " ".join(str(claim.get("claim_text") or "").split())
+            if text:
+                lines.append(f"• {text}（{label} · {confidence}%{sensitive}）")
+    lines.extend(["", "📌 由群聊记录自动整理，可能不完整；有新发言后会继续更新。"])
+    return "\n".join(lines)
+
+
 def search_member_profiles(
     conn: sqlite3.Connection, group_id: str, query: str, limit: int = 10
 ) -> list[dict[str, Any]]:
@@ -715,8 +775,51 @@ class _ValidationError(ValueError):
 
 def _safe_error(exc: BaseException) -> str:
     """Bounded diagnostic that never includes prompt/model/chat text."""
-
+    if isinstance(exc, _ValidationError):
+        message = str(exc)
+        categories = (
+            ("not valid JSON", "invalid_json"),
+            ("must be a JSON object", "not_object"),
+            ("unknown LLM output keys", "unknown_output_keys"),
+            ("unknown profile section", "unknown_profile_section"),
+            ("unknown claim keys", "unknown_claim_keys"),
+            ("claim section is invalid", "invalid_claim_section"),
+            ("claim text is required", "missing_claim_text"),
+            ("claim basis is invalid", "invalid_claim_basis"),
+            ("claim confidence", "invalid_claim_confidence"),
+            ("claim sensitive", "invalid_sensitive_flag"),
+            ("claim evidence", "invalid_evidence_array"),
+            ("requires evidence", "missing_evidence"),
+            ("evidence id", "invalid_evidence_id"),
+            ("evidence crosses", "cross_scope_evidence"),
+            ("identified member requires", "empty_identified_profile"),
+            ("updated profile section requires", "profile_without_claim"),
+            ("supersede", "invalid_supersede"),
+        )
+        category = next((name for marker, name in categories if marker in message), "schema_mismatch")
+        return f"_ValidationError: {category}"
     return f"{exc.__class__.__name__}: member update failed"
+
+
+def _validation_retry_feedback(exc: BaseException) -> str:
+    """Give the model actionable schema feedback without persisting content."""
+    if not isinstance(exc, _ValidationError):
+        return "The previous response failed. Return only the required JSON object."
+    message = str(exc).replace("\r", " ").replace("\n", " ")[:240]
+    correction = ""
+    if "claim basis is invalid" in message:
+        correction = (
+            " Set every claim.basis to exactly one of these lowercase English tokens: "
+            "self_reported, observed, inferred."
+        )
+    return (
+        "The previous response was rejected by the local schema validator: "
+        + message
+        + "."
+        + correction
+        + " Correct that exact problem. Return one bare JSON object only; no markdown fence, "
+        "commentary, or extra keys. Copy evidence_ids only from MESSAGES.msg_id."
+    )
 
 
 def _coerce_json_response(raw: Any) -> dict[str, Any]:
@@ -729,8 +832,13 @@ def _coerce_json_response(raw: Any) -> dict[str, Any]:
             raw = raw.decode("utf-8")
         if not isinstance(raw, str) or not raw.strip():
             raise _ValidationError("LLM output must be a JSON object")
+        text = raw.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+                text = "\n".join(lines[1:-1]).strip()
         try:
-            obj = json.loads(raw)
+            obj = json.loads(text)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise _ValidationError("LLM output is not valid JSON") from exc
     if not isinstance(obj, dict):
@@ -925,6 +1033,23 @@ def _validate_llm_output(
         raise _ValidationError(
             "each updated profile section requires an evidence-linked claim"
         )
+    if member != UNKNOWN_MEMBER_ID and not claims:
+        has_current_claim = conn.execute(
+            "SELECT 1 FROM member_claims WHERE group_id=? AND sender_wxid=? AND status='current' LIMIT 1",
+            (group_id, member),
+        ).fetchone()
+        has_substantive_text = any(
+            bool(
+                str(row.get("content_text") or "").strip()
+                or str(row.get("transcript") or "").strip()
+                or str(row.get("quote_text") or "").strip()
+            )
+            for row in supplied
+        )
+        if has_current_claim is None and has_substantive_text:
+            raise _ValidationError(
+                "identified member requires at least one evidence-linked claim"
+            )
     return {
         "profile": profile_obj,
         "summary_text": summary,
@@ -985,8 +1110,12 @@ def _render_chunk_user(
         "optional profile (fixed sections), summary_text, and claims. Every profile "
         "section you update must have at least one claim in that same section. Each claim "
         "must include section, claim_text, basis, confidence (0..1), sensitive, "
-        "and evidence_ids from the supplied msg_id values. You may supersede "
-        "current claim ids for this same member.\n"
+        "and evidence_ids from the supplied msg_id values. "
+        "Basis must be exactly one of the lowercase English tokens self_reported, "
+        "observed, or inferred; do not translate these enum values. "
+        "You may supersede current claim ids for this same member. For an identified member with "
+        "substantive text and no current claims, do not return an empty object: "
+        "create at least one conservative claim supported by a supplied msg_id.\n"
         f"CURRENT_PROFILE={_json_dump(profile or {})}\n"
         f"CURRENT_CLAIMS={_json_dump(list(claims))}\n"
         f"MESSAGES={_json_dump(serial_messages)}"
@@ -1307,6 +1436,7 @@ def run_member_update(
             except Exception as exc:
                 last_error = _safe_error(exc)
                 if attempt + 1 < max_attempts:
+                    user = user + "\n\nVALIDATION_RETRY=" + _validation_retry_feedback(exc)
                     try:
                         sleep(float(2**attempt))
                     except Exception:
@@ -1532,6 +1662,20 @@ class MemberKnowledgeScheduler:
         submitted = 0
         skipped = 0
         errors: list[str] = []
+        # Keep only enough long-context work queued to occupy the configured
+        # workers.  A whole-group bootstrap must not flood the executor and
+        # compete with interactive mentions for the same provider account.
+        with self._lock:
+            in_flight = sum(not future.done() for future in self._futures.values())
+        available_slots = max(0, self.max_workers - in_flight)
+        if available_slots == 0:
+            self._last_submit = current
+            return {
+                "submitted": 0,
+                "skipped": 0,
+                "errors": [],
+                "mature_until": mature_end,
+            }
         try:
             with get_conn(self.db_path) as conn:
                 where = ["1=1"]
@@ -1563,13 +1707,17 @@ class MemberKnowledgeScheduler:
                         MAX(msg_id) AS latest_msg_id,
                         MAX(CASE WHEN t < ? THEN msg_id END) AS mature_msg_id,
                         MAX(t) AS last_t
-                      FROM messages
+                     FROM messages
                      WHERE """ + " AND ".join(where) + """
                      GROUP BY group_id, CASE WHEN sender_wxid IS NULL OR TRIM(sender_wxid)='' THEN ? ELSE TRIM(sender_wxid) END
+                     ORDER BY (CASE WHEN sender_wxid IS NULL OR TRIM(sender_wxid)='' THEN ? ELSE TRIM(sender_wxid) END)=?,
+                              group_id, sender_wxid
                     """,
-                    [UNKNOWN_MEMBER_ID, mature_end, *params, UNKNOWN_MEMBER_ID],
+                    [UNKNOWN_MEMBER_ID, mature_end, *params, UNKNOWN_MEMBER_ID, UNKNOWN_MEMBER_ID, UNKNOWN_MEMBER_ID],
                 ).fetchall()
                 for row in rows:
+                    if submitted >= available_slots:
+                        break
                     key = (str(row["group_id"]), str(row["sender_wxid"]))
                     state = _fetch_state(conn, *key)
                     full_history_complete = bool(
@@ -1631,6 +1779,8 @@ __all__ = [
     "normalize_member_id",
     "list_member_profiles",
     "get_member_profile",
+    "select_random_completed_profile",
+    "render_member_profile_card",
     "search_member_profiles",
     "list_member_messages",
     "build_active_member_context",

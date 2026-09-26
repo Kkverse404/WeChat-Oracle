@@ -1,9 +1,22 @@
+param(
+    [switch]$PreserveLocalConfig
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $specPath = Join-Path $repoRoot "packaging\wechat-oracle.spec"
 $outputDir = Join-Path $repoRoot "dist\WeChatOracle"
 $exePath = Join-Path $outputDir "WeChatOracle.exe"
+$localConfigPath = Join-Path $outputDir ".env"
+$configBackupPath = $null
+
+if ($PreserveLocalConfig -and (Test-Path -LiteralPath $localConfigPath -PathType Leaf)) {
+    $configBackupPath = Join-Path ([System.IO.Path]::GetTempPath()) (
+        "wechat-oracle-config-" + [guid]::NewGuid().ToString("N") + ".env"
+    )
+    Copy-Item -LiteralPath $localConfigPath -Destination $configBackupPath
+}
 
 Push-Location $repoRoot
 try {
@@ -61,5 +74,11 @@ try {
     Write-Host "Distribute the entire dist\WeChatOracle directory, not only the EXE."
 }
 finally {
+    if ($configBackupPath -and (Test-Path -LiteralPath $configBackupPath -PathType Leaf)) {
+        New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+        Copy-Item -LiteralPath $configBackupPath -Destination $localConfigPath -Force
+        Remove-Item -LiteralPath $configBackupPath -Force
+        Write-Host "Restored local runtime configuration after the clean build."
+    }
     Pop-Location
 }

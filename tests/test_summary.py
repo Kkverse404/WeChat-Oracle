@@ -1,6 +1,7 @@
 import sqlite3
 
 from wechat_oracle.dispatcher import Candidate, SumCommand, fetch_candidates, parse_command, summarize_chat_hierarchical
+from wechat_oracle.prompts import SUM_SYSTEM
 
 
 class FakeLLM:
@@ -18,6 +19,13 @@ class OversizedFakeLLM(FakeLLM):
     def complete_text(self, *, model, system, user, temperature=0.3, max_tokens=None):
         self.calls.append(user)
         return "长" * 100
+
+
+def test_summary_prompt_hard_codes_named_and_playful_attribution() -> None:
+    assert "直接写昵称" in SUM_SYSTEM
+    assert "不要把已知昵称降格成“群友”" in SUM_SYSTEM
+    assert "绝不能根据内容、画像或常识猜名字" in SUM_SYSTEM
+    assert "略带俏皮感" in SUM_SYSTEM
 
 
 def test_natural_summary_routes_to_sum() -> None:

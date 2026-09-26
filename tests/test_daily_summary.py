@@ -4,8 +4,12 @@ import time
 from zoneinfo import ZoneInfo
 
 from wechat_oracle.config import settings
+from wechat_oracle.cli import _explicit_summary_period
 from wechat_oracle.daily_summary import (
+    latest_active_hour,
+    deliver_manual_text,
     recover_pending_deliveries,
+    reset_failed_summary_period,
     run_daily_group,
     run_summary_group,
     split_message,
@@ -25,9 +29,76 @@ class FakeLLM:
         return "重点：大家完成了测试。"
 
 
+def test_explicit_summary_period_uses_configured_timezone(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "summary_timezone", "Asia/Hong_Kong")
+    period = _explicit_summary_period("2026-08-12T08:00", "2026-08-12T09:00")
+    assert period.kind == "hourly"
+    assert datetime.fromtimestamp(period.start_t, TZ).hour == 8
+    assert datetime.fromtimestamp(period.end_t, TZ).hour == 9
+    assert "2026-08-12 08:00+0800" in period.label
+
+
+def test_manual_card_uses_outbox_without_summary_header(tmp_path: Path) -> None:
+    db_path = tmp_path / "manual-card.db"
+    init_db(db_path)
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        result = deliver_manual_text(
+            conn,
+            group_id="g1",
+            group_name="group one",
+            text="#成员画像（Alice）\n\n画像正文",
+            replier=replier,
+            require_current_authorization=False,
+            sleep=lambda _: None,
+        )
+        status = conn.execute(
+            "SELECT sr.status,o.status FROM summary_runs sr JOIN delivery_outbox o ON o.summary_run_id=sr.run_id"
+        ).fetchone()
+    assert result == "sent"
+    assert tuple(status) == ("sent", "sent")
+    assert replier.sent[0][2].startswith("#成员画像（Alice）")
+    assert "#群聊话题" not in replier.sent[0][2]
+
+
+def test_manual_card_marker_is_restart_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "manual-marker.db"
+    init_db(db_path)
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        first = deliver_manual_text(
+            conn, group_id="g1", group_name="group one", text="card",
+            replier=replier, require_current_authorization=False,
+            delivery_marker=-123, sleep=lambda _: None,
+        )
+        second = deliver_manual_text(
+            conn, group_id="g1", group_name="group one", text="card",
+            replier=replier, require_current_authorization=False,
+            delivery_marker=-123, sleep=lambda _: None,
+        )
+        assert conn.execute("SELECT COUNT(*) FROM summary_runs").fetchone()[0] == 1
+    assert first == "sent"
+    assert second == "duplicate"
+    assert len(replier.sent) == 1
+
+
 class ExplodingLLM:
     def complete_text(self, **kwargs):
         raise AssertionError("an existing ready summary must not be regenerated")
+
+
+class AttributionRetryLLM:
+    name = "fake"
+
+    def __init__(self, corrected: bool = True):
+        self.calls = 0
+        self.corrected = corrected
+
+    def complete_text(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1 or not self.corrected:
+            return "群友说今天把测试搞定了。"
+        return "小明把测试收尾，还顺手给 bug 盖上了小被子 🐛"
 
 
 class FakeReplier:
@@ -71,6 +142,119 @@ def _insert_run(conn, status: str, summary_text: str | None = None) -> int:
         (period_start, period_end, status, summary_text),
     )
     return int(cur.lastrowid)
+
+
+def _seed_named_period(conn, period: SummaryPeriod) -> None:
+    for index in range(5):
+        conn.execute(
+            """
+            INSERT INTO messages
+                (group_id,group_name,sender_wxid,sender_display,t,type,
+                 content_text,source,dedupe_key)
+            VALUES ('named','命名群','wx-a','小明',?,'text',?,'live',?)
+            """,
+            (period.start_t + index, f"测试消息{index}", f"named-{index}"),
+        )
+
+
+def test_named_summary_retries_generic_attribution_before_sending(tmp_path: Path) -> None:
+    db_path = tmp_path / "attribution.db"
+    init_db(db_path)
+    period = SummaryPeriod("hourly", 100, 200, "test")
+    llm = AttributionRetryLLM()
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        _seed_named_period(conn, period)
+        result = run_summary_group(
+            conn,
+            group_id="named",
+            group_name="命名群",
+            period=period,
+            min_messages=5,
+            replier=replier,
+            llm=llm,
+            sleep=lambda _: None,
+        )
+    assert result == "sent"
+    assert llm.calls == 2
+    assert "小明" in replier.sent[0][2]
+
+
+def test_named_summary_is_not_sent_when_retry_stays_generic(tmp_path: Path) -> None:
+    db_path = tmp_path / "attribution-fail.db"
+    init_db(db_path)
+    period = SummaryPeriod("hourly", 100, 200, "test")
+    llm = AttributionRetryLLM(corrected=False)
+    replier = FakeReplier()
+    with get_conn(db_path) as conn:
+        _seed_named_period(conn, period)
+        result = run_summary_group(
+            conn,
+            group_id="named",
+            group_name="命名群",
+            period=period,
+            min_messages=5,
+            replier=replier,
+            llm=llm,
+            sleep=lambda _: None,
+        )
+        status = conn.execute("SELECT status FROM summary_runs").fetchone()[0]
+    assert result == "failed"
+    assert status == "failed"
+    assert llm.calls == 2
+    assert replier.sent == []
+
+
+def test_latest_active_hour_skips_sparse_newer_bucket(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "active.db"
+    init_db(db_path)
+    monkeypatch.setattr(settings, "bot_name", "")
+    start = int(datetime(2026, 8, 11, 23, 0, tzinfo=TZ).timestamp())
+    with get_conn(db_path) as conn:
+        for index in range(5):
+            conn.execute(
+                """
+                INSERT INTO messages
+                    (group_id,group_name,t,type,content_text,source,dedupe_key)
+                VALUES ('g1','group one',?,'text',?,'live',?)
+                """,
+                (start + index, f"active-{index}", f"active-{index}"),
+            )
+        conn.execute(
+            """
+            INSERT INTO messages
+                (group_id,group_name,t,type,content_text,source,dedupe_key)
+            VALUES ('g1','group one',?,'text','sparse','live','sparse')
+            """,
+            (start + 3600,),
+        )
+        period = latest_active_hour(
+            conn,
+            group_id="g1",
+            min_messages=5,
+            now=datetime(2026, 8, 12, 9, 0, tzinfo=TZ),
+        )
+    assert period is not None
+    assert (period.start_t, period.end_t) == (start, start + 3600)
+
+
+def test_failed_unsent_period_requires_explicit_safe_reset(tmp_path: Path) -> None:
+    db_path = tmp_path / "failed.db"
+    init_db(db_path)
+    period = SummaryPeriod("daily", 1, 2, "test")
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO summary_runs
+                (group_id,period_start,period_end,trigger_kind,status,started_at)
+            VALUES ('g1',1,2,'daily','failed',1)
+            """
+        )
+        assert reset_failed_summary_period(conn, group_id="g1", period=period)
+        row = conn.execute(
+            "SELECT status, generation_attempt_count FROM summary_runs"
+        ).fetchone()
+        assert tuple(row) == ("running", 1)
 
 
 def test_daily_summary_is_idempotent(tmp_path: Path, monkeypatch) -> None:

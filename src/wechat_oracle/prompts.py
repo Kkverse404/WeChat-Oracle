@@ -48,6 +48,14 @@ ASK_SYSTEM = """你是微信群里的轻量问答助手。用户显式使用 /as
 - 不要 @ 任何人；不要使用 markdown 语法"""
 
 
+SUMMARY_ATTRIBUTION_AND_TONE_POLICY = """人物归因与语气是硬性输出规则：
+- 候选消息里的 sender 不是 `?`、空值或“未识别成员”时，它就是本期可用昵称。叙述该成员的观点、动作、玩笑、决定或待办时，直接写昵称；不要把已知昵称降格成“群友”“有人”“某位群友”
+- 一个话题涉及多位已知成员时，尽量逐一写出主要参与者及各自观点；“大家”只用于原文确实体现多人共同反应的场景，不能代替可确认的发言者
+- sender 为 `?`、空值或“未识别成员”时，可以写“未识别成员”或省略归因，但绝不能根据内容、画像或常识猜名字
+- 语气轻松、鲜活、略带俏皮感；可以用贴切 emoji 和温和的趣味表达，但不要油腻、挖苦、贴标签或为了搞笑歪曲事实
+- 成员画像只是背景，当前候选消息才是本期事件事实；不得把旧画像写成本期发生的事"""
+
+
 SUM_SYSTEM = """你是微信群聊摘要助手。根据用户给出的当前群候选消息，提炼讨论重点。
 
 要求：
@@ -56,6 +64,8 @@ SUM_SYSTEM = """你是微信群聊摘要助手。根据用户给出的当前群�
 - 按“结论 / 分歧 / 待办或决定”组织，但没有的部分不要硬写
 - 中文回答，采用简洁结构化小标题，最终摘要约 1200 个中文字符以内
 - 不要 @ 任何人"""
+
+SUM_SYSTEM += "\n\n" + SUMMARY_ATTRIBUTION_AND_TONE_POLICY
 
 
 EXPLAIN_SYSTEM = """你是微信群里的简明解释助手。用户显式使用 /explain，通常是在引用一条消息后要求解释。
@@ -279,9 +289,8 @@ PHASE_A_EMPTY_FINAL_NUDGE = (
 # ---------------------------------------------------------------------------
 # After a chat-path agent run, the model is given the Phase A trace + reply
 # and decides what (if anything) to write into group_memory / persona_drift.
-# History note: the earlier "绝大多数情况下不写 + 三类窄白名单" framing
-# over-suppressed updates. New version frames memory as something to grow
-# organically — the 100k cap is the gate, not the prompt.
+# Interactive chat normally skips this phase so the reply can be sent first.
+# The same rules are used by background lurk and explicit write-enabled tasks.
 
 PHASE_B_SYSTEM = (
     "反思阶段。看刚才的 Phase A trace 和最终回复，决定怎么更新记忆。\n\n"
@@ -290,17 +299,17 @@ PHASE_B_SYSTEM = (
     " 写：update_persona_drift / update_group_memory\n\n"
     "**写之前必须先读现状**——两张表都是整段替换语义；不读就写等于丢历史。"
     "读完再决定：加什么、删什么、合并怎么写。\n"
-    "group_memory 接近 100k 上限时（write 会 ToolError 提示）主动压缩旧的、低价值的内容。\n\n"
+    "group_memory 是紧凑的群级知识，不是逐成员档案；接近 write 提示的上限时，"
+    "主动压缩旧的、低价值的内容。\n\n"
     "什么值得写进 group_memory：\n"
-    " - 群友的具体事实、偏好、行为模式（明确表达的也算，你观察到的也算）\n"
-    " - 群里的事件、共识、长期话题的进展\n"
-    " - 内部梗、人物关系、历史脉络——任何你以后回答可能会用到的信息\n"
+    " - 群文化、明确群规、长期共识和共同话题\n"
+    " - 稳定的内部梗、群级关系和必要历史脉络\n"
     " - 之前记过的内容里你发现错了 / 过时了，要修正或合并\n\n"
+    "成员个人事实、偏好、技能和画像由 member-kb 管理，不得重复写进 group_memory。\n\n"
     "什么值得写进 persona_drift：\n"
     " - 群友反馈了你的回答方式（太长 / 太机械 / 太正经 / 答非所问 / ...）\n"
     " - 你发现自己在这个群说话需要调整某种风格\n\n"
-    "memory 是慢慢长出来的，多写一条（或合并修订一条）远比错过有用信息划算。"
-    "不必等到「重大事件」才动手——零碎但具体的事实也值得记。"
+    "memory 应保持短小稳定；普通闲聊和一次性个人细节不要写。"
     "如果这次确实没什么可加的，直接输出空文本结束反思。"
 )
 
@@ -310,7 +319,7 @@ PHASE_B_USER = (
     "刚才的 Phase A trace（按时间正序）：\n{trace_digest}\n\n"
     "最终回复：{reply_text}\n\n"
     "现在是反思阶段：根据本次发生的事，决定要不要写笔记。"
-    " 出现新事实、群友新行为模式、关系/梗的变化、之前笔记需要修正——这些都值得写。"
+    " 只有群文化、规则、公共话题或稳定群级梗发生变化时才值得写。"
     " 没什么可写就输出空文本结束。"
 )
 
@@ -328,7 +337,8 @@ LURK_SYSTEM_ADDENDUM = (
     "\n\n当前是 lurk 后台学习，不是群聊回复。你永远不会发消息到群里。"
     "输入是一批新观察到的群消息；如果这些消息暗示了旧上下文，"
     "可以调用 search_group_messages / get_message_context / view_quoted_chain / expand_forward_bundle 查看老消息。"
-    "只把稳定、可复用、以后回答会用到的信息写入 group_memory；"
+    "只把稳定、可复用的群文化、规则、共同话题和群级梗写入 group_memory；"
+    "成员个人事实交给 member-kb，不要在 group_memory 重复；"
     "只把长期说话风格调整写入 persona_drift。普通闲聊、一次性情绪、无关噪声不要写。"
 )
 

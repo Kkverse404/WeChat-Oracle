@@ -52,6 +52,10 @@ def test_member_kb_first_enable_requires_explicit_consent(tmp_path, monkeypatch)
         async with app.run_test(size=(120, 50)) as pilot:
             await pilot.click("#config-menu-member-kb")
             assert app.screen.query_one("#member-kb-consent-confirm")
+            consent = str(app.screen.query_one("#config-value-help").render())
+            assert "自动在后台完整回放历史" in consent
+            assert "无需手工执行 bootstrap" in consent
+            assert "产品不会猜名字" in consent
             await pilot.click("#member-kb-consent-confirm")
             await pilot.pause()
             await pilot.click("#config-menu-save")

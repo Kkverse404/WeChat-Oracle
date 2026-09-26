@@ -328,6 +328,30 @@ def _migrate_member_knowledge(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_member_update_runs_member
             ON member_update_runs(group_id, sender_wxid, started_at);
+        CREATE TABLE IF NOT EXISTS member_profile_broadcasts (
+            campaign_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('running','complete','partial','cancelled')),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_member_profile_broadcasts_status
+            ON member_profile_broadcasts(status, updated_at);
+        CREATE TABLE IF NOT EXISTS member_profile_broadcast_items (
+            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL REFERENCES member_profile_broadcasts(campaign_id) ON DELETE CASCADE,
+            sender_wxid TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')),
+            delivery_marker INTEGER NOT NULL UNIQUE,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL,
+            UNIQUE(campaign_id, sender_wxid)
+        );
+        CREATE INDEX IF NOT EXISTS idx_member_profile_broadcast_items_due
+            ON member_profile_broadcast_items(campaign_id, status, item_id);
         """
     )
 

@@ -88,9 +88,17 @@ def run_ui_live() -> None:
         raise RuntimeError("wx4py is required for WO_INGEST_BACKEND=wx4py") from exc
 
     wx = WeChatClient()
+    logger.info("ui ingest: connecting to visible WeChat")
     wx.connect()
     try:
-        _backfill_visible_history(wx, settings.groups)
+        # The raw watcher already provides complete history and stable sender
+        # identity. Re-reading up to 5000 UI rows here is redundant and can
+        # block startup indefinitely in a busy group, preventing the listener
+        # from ever reaching new @mentions.
+        if settings.raw_wechat_enabled:
+            logger.info("ui ingest: raw sync enabled; skipping visible-history backfill")
+        else:
+            _backfill_visible_history(wx, settings.groups)
 
         def on_message(event) -> None:
             content = str(event.content or "").strip()

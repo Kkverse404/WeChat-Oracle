@@ -19,7 +19,7 @@ class _CaptureLLM:
 
     def complete_text(self, *, model, system, user, temperature=0.3, max_tokens=None):
         self.users.append(user)
-        return "summary"
+        return "Alice 分享了 current event，今天的主线很清楚 ✨"
 
 
 class _Replier:

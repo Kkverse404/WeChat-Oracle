@@ -28,6 +28,62 @@ COMMANDS = ("scan", "groups", "authorize", "revoke", "sync", "run", "status")
 SNAPSHOT_NAME = re.compile(r"^(message_\d+|contact)(?:\.snapshot-\d+)?\.db$")
 
 
+def _is_fresh_inbound_mention(message, observed_at: float) -> bool:
+    """Conservative eligibility gate for the raw-db reply fallback."""
+    if not settings.raw_wechat_reply_fallback_enabled or not settings.bot_name:
+        return False
+    if not message.sender_wxid:
+        return False  # outgoing/self rows are intentionally represented without a sender id
+    if settings.bot_wxid and message.sender_wxid == settings.bot_wxid:
+        return False
+    if int(message.t) < int(observed_at) - settings.raw_wechat_reply_fallback_max_age_seconds:
+        return False
+    text = str(message.content_text or "")
+    return re.search(
+        rf"@{re.escape(settings.bot_name)}(?:\s|$)",
+        text,
+        re.DOTALL,
+    ) is not None
+
+
+def _register_raw_reply_candidates(
+    archive: sqlite3.Connection,
+    messages: list,
+    observed_at: float,
+) -> int:
+    """Register exact archived rows without changing their backfill provenance."""
+    if not messages:
+        return 0
+    expires_at_floor = observed_at + 30.0
+    registered = 0
+    for message in messages:
+        if not message.wx_msg_id:
+            continue
+        row = archive.execute(
+            "SELECT msg_id FROM messages WHERE group_id=? AND wx_msg_id=?",
+            (message.group_id, message.wx_msg_id),
+        ).fetchone()
+        if row is None:
+            continue
+        expires_at = max(
+            float(message.t) + settings.raw_wechat_reply_fallback_max_age_seconds,
+            expires_at_floor,
+        )
+        registered += archive.execute(
+            """
+            INSERT OR IGNORE INTO raw_reply_candidates
+                (msg_id, discovered_at, expires_at, reason)
+            VALUES (?, ?, ?, 'exact_mention')
+            """,
+            (row["msg_id"], observed_at, expires_at),
+        ).rowcount
+    archive.execute(
+        "DELETE FROM raw_reply_candidates WHERE expires_at < ?",
+        (observed_at - 86400.0,),
+    )
+    return registered
+
+
 def _require_opt_in() -> None:
     if not settings.raw_wechat_enabled:
         raise SystemExit("refusing: enable local WeChat read access in the application first")
@@ -454,6 +510,7 @@ def _sync_authorized_groups_once(
     )
     attempted_total = 0
     inserted_total = 0
+    reply_candidates_total = 0
     synchronized = 0
 
     with get_conn(archive_path) as archive:
@@ -484,6 +541,13 @@ def _sync_authorized_groups_once(
                 if cursor is not None and str(cursor["database_generation"]) == generation:
                     after_local_ids[shard_id] = int(cursor["last_local_id"])
 
+            observed_at = time.time()
+            reply_candidates: list = []
+
+            def observe_message(message) -> None:
+                if _is_fresh_inbound_mention(message, observed_at):
+                    reply_candidates.append(message)
+
             _, attempted, inserted, cursors = (
                 import_authorized_group_text_messages_many_with_cursors(
                     archive,
@@ -492,9 +556,15 @@ def _sync_authorized_groups_once(
                     group_id=group_id,
                     group_name=current_groups[group_id],
                     after_local_ids=after_local_ids,
+                    message_observer=observe_message,
                 )
             )
             with transaction(archive):
+                reply_candidates_total += _register_raw_reply_candidates(
+                    archive,
+                    reply_candidates,
+                    observed_at,
+                )
                 for shard_id, last_local_id in cursors.items():
                     archive.execute(
                         """
@@ -527,6 +597,7 @@ def _sync_authorized_groups_once(
         "shards": len(message_dbs),
         "attempted": attempted_total,
         "inserted": inserted_total,
+        "reply_candidates": reply_candidates_total,
     }
     failed_sources = set(unlocked["failures"])
     state = _load_state(state_file)

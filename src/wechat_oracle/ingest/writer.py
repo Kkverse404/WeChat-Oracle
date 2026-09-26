@@ -68,12 +68,12 @@ def _reconcile_exact_ui_live(conn: sqlite3.Connection, msg: Message) -> bool:
         """
         SELECT msg_id
           FROM messages
-         WHERE group_id=? AND t=? AND type=?
+         WHERE group_id=? AND t BETWEEN ? AND ? AND type=?
            AND COALESCE(content_text, '')=COALESCE(?, '')
            AND source='live' AND wx_msg_id LIKE 'ui-live:%'
         LIMIT 2
         """,
-        (msg.group_id, msg.t, msg.type.value, msg.content_text),
+        (msg.group_id, msg.t - 5, msg.t + 5, msg.type.value, msg.content_text),
     ).fetchall()
     if len(rows) != 1:
         return False
@@ -96,6 +96,36 @@ def _reconcile_exact_ui_live(conn: sqlite3.Connection, msg: Message) -> bool:
         )
     except sqlite3.IntegrityError:
         return False
+    return bool(changed.rowcount)
+
+
+def _reconcile_exact_raw_backfill(conn: sqlite3.Connection, msg: Message) -> bool:
+    """Avoid a second dispatch when UI observes a raw row already archived.
+
+    Raw sync can beat the UI listener by a few seconds. If the later UI event
+    is an exact, unambiguous match, retain the raw identity but mark the row as
+    live so normal UI semantics apply. Ambiguous matches are never guessed.
+    """
+    if msg.source != "live":
+        return False
+    rows = conn.execute(
+        """
+        SELECT msg_id
+          FROM messages
+         WHERE group_id=? AND t BETWEEN ? AND ? AND type=?
+           AND COALESCE(content_text, '')=COALESCE(?, '')
+           AND source='backfill' AND wx_msg_id NOT LIKE 'ui-%'
+        LIMIT 2
+        """,
+        (msg.group_id, msg.t - 5, msg.t + 5, msg.type.value, msg.content_text),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    changed = conn.execute(
+        "UPDATE messages SET source='live', group_name=COALESCE(?, group_name) "
+        "WHERE msg_id=? AND source='backfill'",
+        (msg.group_name, rows[0]["msg_id"]),
+    )
     return bool(changed.rowcount)
 
 
@@ -183,13 +213,17 @@ def write_messages(
         by_type = Counter(m.type.value for m in batch_msgs)
         by_group = Counter(m.group_id for m in batch_msgs)
         with transaction(conn):
-            can_reconcile = bool(
-                conn.execute("SELECT 1 FROM messages WHERE source='live' LIMIT 1").fetchone()
-            )
+            can_reconcile = bool(conn.execute("SELECT 1 FROM messages LIMIT 1").fetchone())
             pending = [
                 message
                 for message in batch_msgs
-                if not (can_reconcile and _reconcile_exact_ui_live(conn, message))
+                if not (
+                    can_reconcile
+                    and (
+                        _reconcile_exact_ui_live(conn, message)
+                        or _reconcile_exact_raw_backfill(conn, message)
+                    )
+                )
             ]
             cur = conn.executemany(INSERT_SQL, [_row(m) for m in pending])
             batch_inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0

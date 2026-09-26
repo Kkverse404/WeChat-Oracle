@@ -49,7 +49,12 @@ class Settings(BaseSettings):
     raw_wechat_account: str = ""
     raw_wechat_workspace: Path = Field(default=Path("data/raw_wechat"))
     raw_wechat_install_root: Path = Field(default=Path(r"D:\0softwear\Weixin"))
-    raw_wechat_sync_interval_seconds: float = 60.0
+    raw_wechat_sync_interval_seconds: float = 30.0
+    # When UI Automation is unavailable, a fresh inbound raw-db @mention may
+    # enter the dispatcher through a short-lived, durable fallback candidate.
+    # Historical rows, outgoing rows and ordinary ambient chat never qualify.
+    raw_wechat_reply_fallback_enabled: bool = True
+    raw_wechat_reply_fallback_max_age_seconds: int = 300
 
     # Dispatcher: bot's @-mention nickname (its 群昵称 in the watched group).
     # Required for `wechat-oracle dispatcher` to recognize commands.
@@ -151,13 +156,15 @@ class Settings(BaseSettings):
     agent_base_probability: float = 0.25       # per-message ambient wake chance
     agent_proactive_mode: str = "reactive"     # off/reactive/proactive probability posture
     agent_cooldown_seconds: int = 30           # min seconds between bot's own utterances per group
-    agent_max_steps: int = 8                   # Phase A read-only loop cap
+    # Keep the interactive path deliberately small. Deep archival work belongs
+    # in member-kb/lurk workers, not in the user's reply critical path.
+    agent_max_steps: int = 4                   # Phase A read-only loop cap
     agent_reflect_max_steps: int = 3           # Phase B write-only loop cap
-    agent_reflection_enabled: bool = True      # off → skip Phase B entirely
+    agent_reflection_enabled: bool = False     # reply first; learn later via lurk/member-kb
     agent_personas_dir: Path = Field(default=Path("data/personas"))
-    agent_recent_context_chat: int = 100       # initial recent-msg window for Phase A system prompt
-    agent_memory_max_chars: int = 100_000      # group_memory hard cap; agent must compact when full
-    agent_max_tool_calls_per_run: int = 20      # Phase A total tool-call budget
+    agent_recent_context_chat: int = 40        # initial recent-msg window for Phase A system prompt
+    agent_memory_max_chars: int = 12_000       # compact group culture/rules/topics only
+    agent_max_tool_calls_per_run: int = 8       # Phase A total tool-call budget
     agent_max_tool_calls_per_step: int = 4      # Phase A per-LLM-turn tool-call budget
     agent_max_image_reads_per_run: int = 2      # expensive read_image budget
     agent_max_voice_reads_per_run: int = 2      # expensive read_voice budget
@@ -282,6 +289,15 @@ class Settings(BaseSettings):
     def _validate_raw_wechat_interval(cls, v: float) -> float:
         if v < 30:
             raise ValueError("WO_RAW_WECHAT_SYNC_INTERVAL_SECONDS must be at least 30")
+        return v
+
+    @field_validator("raw_wechat_reply_fallback_max_age_seconds")
+    @classmethod
+    def _validate_raw_wechat_reply_fallback_max_age(cls, v: int) -> int:
+        if not 30 <= v <= 900:
+            raise ValueError(
+                "WO_RAW_WECHAT_REPLY_FALLBACK_MAX_AGE_SECONDS must be between 30 and 900"
+            )
         return v
 
     @field_validator("pi_thinking")

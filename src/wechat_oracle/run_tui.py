@@ -250,6 +250,11 @@ class MemberKnowledgeConsentScreen(ModalScreen[bool]):
             yield Static(
                 "启用后会把已选群的历史发言和派生画像发送给当前配置的 "
                 "OpenAI-compatible API。模型可推断敏感属性，这些画像可能用于群回复和总结。\n\n"
+                "保存配置并重启调度进程后，产品会自动在后台完整回放历史；中断可按成员游标续跑。"
+                "首次建库完成后，每个整点等待 5 分钟同步宽限，只更新上一小时有新发言的成员，"
+                "并让成员画像任务先于同周期群总结运行，无需手工执行 bootstrap。\n\n"
+                "只有聊天源提供了可靠昵称/成员 ID 才能按人建档和在摘要里点名；"
+                "缺少身份的消息只进入本群“未知成员”桶，产品不会猜名字。\n\n"
                 f"待处理约 {self._message_count} 条消息、{self._member_count} 位成员，"
                 f"预计至少 {self._estimated_calls} 次模型调用。",
                 id="config-value-help",
